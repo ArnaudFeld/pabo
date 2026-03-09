@@ -1,0 +1,32 @@
+# PABO – Paperless-Borg Backup Orchestrator
+# https://github.com/YOUR_USER/pabo
+
+# Konfiguration mit Secrets – niemals committen!
+/etc/paperless-backup.conf
+paperless-backup.conf
+*.conf
+
+# Borg-Passphrase
+.borg_passphrase
+*.passphrase
+
+# Logs
+*.log
+/var/log/paperless-*.log
+
+# Temporäre Backup-Dateien
+*.sql
+*.tmp
+*.swp
+*.lock
+
+# Borg-Repository (lokal)
+/backup/
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*~
