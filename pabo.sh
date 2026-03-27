@@ -1,5 +1,5 @@
 #!/bin/bash
-# pabo.sh – PABO: Paperless-Borg Backup Orchestrator v1.0.1
+# pabo.sh – PABO: Paperless-Borg Backup Orchestrator v1.0.2
 # Automated, encrypted, multi-cloud backups for Paperless-ngx
 # powered by BorgBackup and rclone.
 # https://github.com/ArnaudFeld/pabo
@@ -146,7 +146,7 @@ send_telegram() {
   jq -n \
     --arg cid  "${TELEGRAM_CHAT_ID}" \
     --arg text "$message" \
-    '{"chat_id":$cid,"text":$text,"parse_mode":"HTML"}' | \
+    '{"chat_id":\$cid,"text":\$text,"parse_mode":"HTML"}' | \
   curl -s --max-time 10 --connect-timeout 5 \
     -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
     -H "Content-Type: application/json" \
@@ -482,6 +482,7 @@ run_setup() {
 
   read -rp "   Log-Verzeichnis (${DATA_DIR}/log) ausschließen? (j/n) [j]: " excl_log
   [[ "${excl_log:-j}" == "j" ]] && BORG_EXCLUDES+=("${DATA_DIR}/log")
+  BORG_EXCLUDES+=("${DATA_DIR}/celerybeat-schedule.db")
 
   if [[ -d "${DATA_DIR}/nltk" ]]; then
     read -rp "   NLTK-Daten (${DATA_DIR}/nltk) ausschließen? (j/n) [j]: " excl_nltk
@@ -626,7 +627,7 @@ send_telegram() {
   jq -n \
     --arg cid  "${TELEGRAM_CHAT_ID}" \
     --arg text "$message" \
-    '{"chat_id":$cid,"text":$text,"parse_mode":"HTML"}' | \
+    '{"chat_id":\$cid,"text":\$text,"parse_mode":"HTML"}' | \
   curl -s --max-time 10 --connect-timeout 5 \
     -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
     -H "Content-Type: application/json" \
@@ -833,7 +834,7 @@ send_telegram() {
   jq -n \
     --arg cid  "\${TELEGRAM_CHAT_ID}" \
     --arg text "\$message" \
-    '{"chat_id":\,"text":\,"parse_mode":"HTML"}' | \
+    '{"chat_id":\$cid,"text":\$text,"parse_mode":"HTML"}' | \
   curl -s --max-time 10 --connect-timeout 5 \
     -X POST "https://api.telegram.org/bot\${TELEGRAM_TOKEN}/sendMessage" \
     -H "Content-Type: application/json" \
@@ -901,7 +902,7 @@ send_telegram() {
   jq -n \
     --arg cid  "\${TELEGRAM_CHAT_ID}" \
     --arg text "\$message" \
-    '{"chat_id":$cid,"text":$text,"parse_mode":"HTML"}' | \
+    '{"chat_id":\$cid,"text":\$text,"parse_mode":"HTML"}' | \
   curl -s --max-time 10 --connect-timeout 5 \
     -X POST "https://api.telegram.org/bot\${TELEGRAM_TOKEN}/sendMessage" \
     -H "Content-Type: application/json" \
@@ -1433,7 +1434,7 @@ echo "║  ██╔══██╗██╔══██╗██╔══██
 echo "║  ██████╔╝███████║██████╔╝██║   ██║              ║"
 echo "║  ██╔═══╝ ██╔══██║██╔══██╗██║   ██║              ║"
 echo "║  ██║     ██║  ██║██████╔╝╚██████╔╝              ║"
-echo "║  ╚═╝     ╚═╝  ╚═╝╚═════╝  ╚═════╝  v1.0.1       ║"
+echo "║  ╚═╝     ╚═╝  ╚═╝╚═════╝  ╚═════╝  v1.0.2       ║"
 echo "║  Paperless-Borg Backup Orchestrator              ║"
 echo "╚══════════════════════════════════════════════════╝"
 echo ""
