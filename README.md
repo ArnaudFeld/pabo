@@ -71,12 +71,18 @@ Unterstützte Anbieter (Auswahl): Google Drive, Dropbox, S3, Backblaze B2, OneDr
 ## Installation
 
 ```bash
-# Script herunterladen
-curl -o /usr/local/sbin/pabo.sh \
-  https://raw.githubusercontent.com/ArnaudFeld/pabo/main/pabo.sh
+# Repository klonen
+git clone https://github.com/ArnaudFeld/pabo.git /opt/pabo
 
-# Ausführbar machen
-chmod 755 /usr/local/sbin/pabo.sh
+# Symlink setzen
+ln -s /opt/pabo/pabo.sh /usr/local/sbin/pabo.sh
+chmod 755 /opt/pabo/pabo.sh
+```
+
+### Updates
+
+```bash
+cd /opt/pabo && git pull
 ```
 
 ---
@@ -214,7 +220,7 @@ echo "DEINE_PASSPHRASE" > /root/.borg_passphrase
 chmod 600 /root/.borg_passphrase
 
 # 3. Borg-Repo von Cloud herunterladen
-rclone sync gdrive:/Paperless-Borg-Encrypted /backup/paperless-borg
+rclone sync onedrive:/Paperless-Borg-Encrypted /backup/paperless-borg
 
 # 4. Archive anzeigen
 export BORG_PASSCOMMAND="cat /root/.borg_passphrase"
@@ -253,8 +259,8 @@ TELEGRAM_TOKEN="123456:ABC..."
 TELEGRAM_CHAT_ID="987654321"
 
 BACKUP_TARGETS=(
-  gdrive:/Paperless-Borg-Encrypted          # Format: remote:/pfad
-  dropbox:/Backups/Paperless
+  onedrive:/Paperless-Borg-Encrypted        # Format: remote:/pfad
+  gdrive:/Backups/Paperless
 )
 
 RCLONE_BWLIMIT="2M"                        # Leer = kein Limit, z.B. "2M", "500K"
@@ -278,7 +284,7 @@ EXPORTER_DEST="/usr/src/paperless/export"
 ## Architektur
 
 ```
-paperless-setup.sh
+pabo.sh
 │
 ├── /etc/paperless-backup.conf          ← Zentrale Konfiguration (chmod 600)
 ├── /root/.borg_passphrase              ← Borg-Passphrase (chmod 600)
@@ -373,7 +379,8 @@ sudo pabo.sh  # → 1) setup → 1) Ziele ändern
 ```bash
 # Token und Chat-ID testen:
 curl -s "https://api.telegram.org/bot<TOKEN>/getMe"
-curl -s "https://api.telegram.org/bot<TOKEN>/sendMessage"   -d "chat_id=<CHAT_ID>&text=Test"
+curl -s "https://api.telegram.org/bot<TOKEN>/sendMessage" \
+  -d "chat_id=<CHAT_ID>&text=Test"
 ```
 
 ### Borg Check schlägt fehl

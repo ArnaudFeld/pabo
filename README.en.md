@@ -71,12 +71,18 @@ Supported providers (selection): Google Drive, Dropbox, S3, Backblaze B2, OneDri
 ## Installation
 
 ```bash
-# Download the script
-curl -o /usr/local/sbin/pabo.sh \
-  https://raw.githubusercontent.com/ArnaudFeld/pabo/main/pabo.sh
+# Clone the repository
+git clone https://github.com/ArnaudFeld/pabo.git /opt/pabo
 
-# Make it executable
-chmod 755 /usr/local/sbin/pabo.sh
+# Create symlink
+ln -s /opt/pabo/pabo.sh /usr/local/sbin/pabo.sh
+chmod 755 /opt/pabo/pabo.sh
+```
+
+### Updates
+
+```bash
+cd /opt/pabo && git pull
 ```
 
 ---
@@ -278,7 +284,7 @@ EXPORTER_DEST="/usr/src/paperless/export"
 ## Architecture
 
 ```
-paperless-setup.sh
+pabo.sh
 │
 ├── /etc/paperless-backup.conf          ← Central configuration (chmod 600)
 ├── /root/.borg_passphrase              ← Borg passphrase (chmod 600)
