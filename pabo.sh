@@ -833,7 +833,7 @@ send_telegram() {
   jq -n \
     --arg cid  "\${TELEGRAM_CHAT_ID}" \
     --arg text "\$message" \
-    '{"chat_id":$cid,"text":$text,"parse_mode":"HTML"}' | \
+    '{"chat_id":\,"text":\,"parse_mode":"HTML"}' | \
   curl -s --max-time 10 --connect-timeout 5 \
     -X POST "https://api.telegram.org/bot\${TELEGRAM_TOKEN}/sendMessage" \
     -H "Content-Type: application/json" \
