@@ -1,5 +1,5 @@
 #!/bin/bash
-# pabo.sh – PABO: Paperless-Borg Backup Orchestrator v1.0.2
+# pabo.sh – PABO: Paperless-Borg Backup Orchestrator v1.0.3
 # Automated, encrypted, multi-cloud backups for Paperless-ngx
 # powered by BorgBackup and rclone.
 # https://github.com/ArnaudFeld/pabo
@@ -946,7 +946,7 @@ fi
     ERRORS+=("Borg-Extraktion fehlgeschlagen")
   fi
 
-  EXTRACTED_MEDIA="\${TEST_DIR}\$(echo \${MEDIA_DIR} | sed 's|^/||')"
+  EXTRACTED_MEDIA="\${TEST_DIR}/\$(echo \${MEDIA_DIR} | sed 's|^/||')"
   MEDIA_COUNT=0
   if [[ -d "\$EXTRACTED_MEDIA" ]]; then
     MEDIA_COUNT=\$(find "\$EXTRACTED_MEDIA" -type f | wc -l)
@@ -955,14 +955,14 @@ fi
     ERRORS+=("Media-Verzeichnis fehlt"); log "❌ Media fehlt!"
   fi
 
-  EXTRACTED_DATA="\${TEST_DIR}\$(echo \${DATA_DIR} | sed 's|^/||')"
+  EXTRACTED_DATA="\${TEST_DIR}/\$(echo \${DATA_DIR} | sed 's|^/||')"
   if [[ -d "\$EXTRACTED_DATA" ]]; then
     log "✅ Data-Verzeichnis OK"
   else
     ERRORS+=("Data-Verzeichnis fehlt"); log "❌ Data fehlt!"
   fi
 
-  EXTRACTED_COMPOSE="\${TEST_DIR}\$(echo \${COMPOSE_FILE} | sed 's|^/||')"
+  EXTRACTED_COMPOSE="\${TEST_DIR}/\$(echo \${COMPOSE_FILE} | sed 's|^/||')"
   if [[ -f "\$EXTRACTED_COMPOSE" ]]; then
     log "✅ docker-compose.yml vorhanden"
   else
@@ -1434,7 +1434,7 @@ echo "║  ██╔══██╗██╔══██╗██╔══██
 echo "║  ██████╔╝███████║██████╔╝██║   ██║              ║"
 echo "║  ██╔═══╝ ██╔══██║██╔══██╗██║   ██║              ║"
 echo "║  ██║     ██║  ██║██████╔╝╚██████╔╝              ║"
-echo "║  ╚═╝     ╚═╝  ╚═╝╚═════╝  ╚═════╝  v1.0.2       ║"
+echo "║  ╚═╝     ╚═╝  ╚═╝╚═════╝  ╚═════╝  v1.0.3       ║"
 echo "║  Paperless-Borg Backup Orchestrator              ║"
 echo "╚══════════════════════════════════════════════════╝"
 echo ""
