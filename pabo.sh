@@ -1,5 +1,5 @@
 #!/bin/bash
-# pabo.sh – PABO: Paperless-Borg Backup Orchestrator v1.0.4
+# pabo.sh – PABO: Paperless-Borg Backup Orchestrator v1.0.5
 # Automated, encrypted, multi-cloud backups for Paperless-ngx
 # powered by BorgBackup and rclone.
 # https://github.com/ArnaudFeld/pabo
@@ -30,12 +30,8 @@ load_conf() {
   source "$CONF_FILE"
 }
 
-
 # ─────────────────────────────────────────────
 # CONFIG-VALIDIERUNG nach load_conf / source
-# Prüft Variableninhalte auf erlaubte Zeichensätze bevor sie in
-# Shell-Kommandos verwendet werden. Verhindert Code-Injection durch
-# eine manipulierte CONF_FILE.
 # ─────────────────────────────────────────────
 
 validate_conf() {
@@ -46,8 +42,7 @@ validate_conf() {
     if [[ -z "$val" ]]; then
       echo "❌ Config: ${label} ist leer"; errors=$(( errors + 1 )); return
     fi
-    # Erlaubt: alphanumerisch, / - _ . Leerzeichen verboten, keine Shell-Metazeichen
-    if [[ "$val" =~ [^a-zA-Z0-9/_.\-] ]]; then
+    if [[ "$val" =~ [^a-zA-Z0-9/_.\ -] ]]; then
       echo "❌ Config: ${label} enthält ungültige Zeichen: '${val}'"
       errors=$(( errors + 1 ))
     fi
@@ -58,7 +53,6 @@ validate_conf() {
     if [[ -z "$val" ]]; then
       echo "❌ Config: ${label} ist leer"; errors=$(( errors + 1 )); return
     fi
-    # Container/DB-Namen: alphanumerisch + - _ .
     if [[ "$val" =~ [^a-zA-Z0-9_.\-] ]]; then
       echo "❌ Config: ${label} enthält ungültige Zeichen: '${val}'"
       errors=$(( errors + 1 ))
@@ -80,7 +74,6 @@ validate_conf() {
     fi
   }
 
-  # Pfade
   _check_path "${MEDIA_DIR:-}"    "MEDIA_DIR"
   _check_path "${DATA_DIR:-}"     "DATA_DIR"
   _check_path "${EXPORT_DIR:-}"   "EXPORT_DIR"
@@ -88,36 +81,30 @@ validate_conf() {
   _check_path "${BACKUP_TMP:-}"   "BACKUP_TMP"
   _check_path "${COMPOSE_FILE:-}" "COMPOSE_FILE"
 
-  # Container- und DB-Namen
   _check_name "${PAPERLESS_CONTAINER:-}" "PAPERLESS_CONTAINER"
   _check_name "${DB_CONTAINER:-}"        "DB_CONTAINER"
   _check_name "${DB_NAME:-}"             "DB_NAME"
   _check_name "${DB_USER:-}"             "DB_USER"
 
-  # Numerische Werte
   _check_int "${RCLONE_TRANSFERS:-}" "RCLONE_TRANSFERS"
   _check_int "${RCLONE_CHECKERS:-}"  "RCLONE_CHECKERS"
 
-  # RCLONE_BWLIMIT: optional – leer = kein Limit, sonst z.B. "2M", "1.5M", "500K"
   if [[ -n "${RCLONE_BWLIMIT:-}" ]] && \
      [[ ! "${RCLONE_BWLIMIT}" =~ ^[0-9]+(\.[0-9]+)?[KMGkmg]?$ ]]; then
     echo "❌ Config: RCLONE_BWLIMIT ungültiges Format: '${RCLONE_BWLIMIT}' (erwartet z.B. 2M, 500K, leer)"
     errors=$(( errors + 1 ))
   fi
 
-  # Pflichtfelder ohne Formatprüfung (Tokens können beliebige druckbare Zeichen enthalten)
   _check_nonempty "${TELEGRAM_TOKEN:-}"   "TELEGRAM_TOKEN"
   _check_nonempty "${TELEGRAM_CHAT_ID:-}" "TELEGRAM_CHAT_ID"
 
-  # BACKUP_TARGETS: jedes Element muss "name:/pfad" Form haben
   if [[ ${#BACKUP_TARGETS[@]} -eq 0 ]]; then
     echo "❌ Config: BACKUP_TARGETS ist leer"
     errors=$(( errors + 1 ))
   else
     local t
     for t in "${BACKUP_TARGETS[@]}"; do
-      # Remote-Name: alphanumerisch + - / Pfad: alphanumerisch + / - _ .
-      if [[ ! "$t" =~ ^[a-zA-Z0-9_-]+:[a-zA-Z0-9/_.\-]+$ ]]; then
+      if [[ ! "$t" =~ ^[a-zA-Z0-9_-]+:[a-zA-Z0-9/_.\ -]+$ ]]; then
         echo "❌ Config: BACKUP_TARGETS enthält ungültigen Eintrag: '${t}'"
         errors=$(( errors + 1 ))
       fi
@@ -487,7 +474,7 @@ run_setup() {
   echo ""
   echo "💾 Speichere Konfiguration nach ${CONF_FILE}..."
   cat > "$CONF_FILE" <<EOF
-# PABO – Paperless-Borg Backup Orchestrator v1.0.4
+# PABO – Paperless-Borg Backup Orchestrator v1.0.5
 # Konfiguration erstellt: $(date '+%Y-%m-%d %H:%M:%S')
 
 PAPERLESS_CONTAINER="${PAPERLESS_CONTAINER}"
@@ -1149,14 +1136,29 @@ run_restore() {
 
   if [[ "$restore_type" == "1" || "$restore_type" == "2" ]]; then
     echo "🗃 Stelle Datenbank wieder her..."
-    borg extract --stdout "${BORG_REPO}::${ARCHIVE_NAME}" \
-      "backup/paperless-tmp/paperless-db.sql" | \
-    docker exec -i "${DB_CONTAINER}" psql -U "${DB_USER}" "${DB_NAME}" || {
-      send_telegram "❌ Restore fehlgeschlagen
+    # Fix v1.0.5: borg extract --stdout | docker exec BrokenPipeError (Borg 1.4)
+    # Stattdessen: in tmpdir extrahieren, dann psql < file
+    local DB_TMP
+    DB_TMP=$(mktemp -d)
+    local PREV_DIR="$PWD"
+    trap '[[ -n "${DB_TMP:-}" ]] && rm -rf "$DB_TMP"' RETURN
+    cd "$DB_TMP"
+    borg extract "${BORG_REPO}::${ARCHIVE_NAME}" \
+      "backup/paperless-tmp/paperless-db.sql" || {
+        send_telegram "❌ Restore fehlgeschlagen
+🔴 Fehler: [DB] borg extract
+🔢 Exit-Code: ${EXIT_RESTORE}"
+        exit $EXIT_RESTORE
+      }
+    docker exec -i "${DB_CONTAINER}" psql -U "${DB_USER}" "${DB_NAME}" \
+      < "${DB_TMP}/backup/paperless-tmp/paperless-db.sql" || {
+        send_telegram "❌ Restore fehlgeschlagen
 🔴 Fehler: [DB] psql restore
 🔢 Exit-Code: ${EXIT_RESTORE}"
-      exit $EXIT_RESTORE
-    }
+        exit $EXIT_RESTORE
+      }
+    rm -rf "$DB_TMP"
+    cd "$PREV_DIR"
     echo "   ✅ Datenbank wiederhergestellt"
   fi
 
@@ -1321,7 +1323,7 @@ echo "║  ██╔══██╗██╔══██╗██╔══██
 echo "║  ██████╔╝███████║██████╔╝██║   ██║          ║"
 echo "║  ██╔═══╝ ██╔══██║██╔══██╗██║   ██║          ║"
 echo "║  ██║     ██║  ██║██████╔╝╚██████╔╝          ║"
-echo "║  ╚═╝     ╚═╝  ╚═╝╚═════╝  ╚═════╝  v1.0.4      ║"
+echo "║  ╚═╝     ╚═╝  ╚═╝╚═════╝  ╚═════╝  v1.0.5      ║"
 echo "║  Paperless-Borg Backup Orchestrator          ║"
 echo "╚══════════════════════════════════════════════╝"
 echo ""
