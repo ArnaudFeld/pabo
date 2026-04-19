@@ -1,6 +1,6 @@
 🇩🇪 Deutsch | [🇬🇧 English](README.en.md)
 
----
+***
 
 # PABO – Paperless-Borg Backup Orchestrator
 
@@ -12,7 +12,7 @@ Ich betreibe seit Jahren eine eigene [Paperless-ngx](https://github.com/paperles
 
 Auf BorgBackup bin ich durch Vorträge aus dem CCC-Umfeld gestoßen. Die Kombination aus Deduplizierung, Verschlüsselung und Effizienz hat mich überzeugt. PABO ist das Ergebnis davon: ein Skript, das genau das tut was ich für meine Instanz brauche – nicht mehr, nicht weniger.
 
----
+***
 
 ## Inhaltsverzeichnis
 
@@ -29,7 +29,7 @@ Auf BorgBackup bin ich durch Vorträge aus dem CCC-Umfeld gestoßen. Die Kombina
 - [Fehlerbehandlung & Exit-Codes](#fehlerbehandlung--exit-codes)
 - [Häufige Probleme](#häufige-probleme)
 
----
+***
 
 ## Funktionsübersicht
 
@@ -45,7 +45,7 @@ Auf BorgBackup bin ich durch Vorträge aus dem CCC-Umfeld gestoßen. Die Kombina
 | 📱 Benachrichtigungen | Telegram bei Erfolg und Fehler |
 | ⏰ Automatisierung | Systemd Timer (kein cron notwendig) |
 
----
+***
 
 ## Voraussetzungen
 
@@ -55,7 +55,7 @@ Auf BorgBackup bin ich durch Vorträge aus dem CCC-Umfeld gestoßen. Die Kombina
 - Root-Zugriff
 
 ### Software (wird automatisch installiert)
-- `borgbackup` ≥ 1.2
+- `borgbackup` ≥ 1.4
 - `rclone`
 - `jq`
 - `curl`
@@ -66,7 +66,7 @@ Mindestens ein konfigurierter rclone-Remote. Falls noch keiner vorhanden ist, st
 
 Unterstützte Anbieter (Auswahl): Google Drive, Dropbox, S3, Backblaze B2, OneDrive, SFTP, WebDAV – [alle rclone-Remotes](https://rclone.org/overview/).
 
----
+***
 
 ## Installation
 
@@ -85,7 +85,7 @@ chmod 755 /opt/pabo/pabo.sh
 cd /opt/pabo && git pull
 ```
 
----
+***
 
 ## Ersteinrichtung
 
@@ -124,7 +124,7 @@ Nach dem Setup wird eine zufällige Passphrase generiert und in `/root/.borg_pas
 
 **Empfehlung:** Passphrase in einem Passwortmanager (Bitwarden, 1Password, KeePass) oder ausgedruckt an einem sicheren Ort aufbewahren.
 
----
+***
 
 ## Täglicher Betrieb
 
@@ -160,7 +160,7 @@ tail -50 /var/log/paperless-restore-test.log
 journalctl -u paperless-backup-<remote>.service -n 50
 ```
 
----
+***
 
 ## Manuelle Aktionen
 
@@ -190,7 +190,7 @@ Beim erneuten Aufruf von `setup` mit vorhandener `/etc/paperless-backup.conf`:
 sudo pabo.sh  # → 1) setup → 2) Nur neu generieren
 ```
 
----
+***
 
 ## Restore
 
@@ -230,16 +230,28 @@ borg list /backup/paperless-borg
 sudo pabo.sh  # → 2) restore
 ```
 
-> **Hinweis zu schwerer Datenbank-Korruption:** Falls `psql` beim Einspielen fehlschlägt, zuerst manuell `DROP DATABASE paperless; CREATE DATABASE paperless;` im PostgreSQL-Container ausführen, dann erneut restore.
+> **Hinweis zu schwerer Datenbank-Korruption:** Falls `psql` beim Einspielen
+> fehlschlägt, muss die Datenbank zuerst manuell geleert werden. Wichtig: Der
+> `DROP`-Befehl muss über die `postgres`-Datenbank laufen, nicht über `paperless`
+> (sonst: `cannot drop the currently open database`):
+>
+> ```bash
+> docker exec db psql -U paperless -d postgres -c "DROP DATABASE paperless;"
+> docker exec db psql -U paperless -d postgres -c "CREATE DATABASE paperless OWNER paperless;"
+> ```
+>
+> Eine Warnung wie `collation version mismatch` beim Verbinden ist harmlos und kann
+> ignoriert werden – sie betrifft nur interne Sortierungsmetadaten und blockiert
+> den Restore nicht.
 
----
+***
 
 ## Konfigurationsreferenz
 
 Die Konfiguration liegt in `/etc/paperless-backup.conf` (chmod 600, nur root lesbar).
 
 ```bash
-# Paperless Backup Konfiguration
+# PABO – Paperless Backup Konfiguration
 
 PAPERLESS_CONTAINER="paperless-webserver"   # Docker Container Name
 DB_CONTAINER="paperless-db"                 # PostgreSQL Container Name
@@ -279,7 +291,7 @@ ENABLE_DOCUMENT_EXPORTER="false"           # true = document_exporter vor Backup
 EXPORTER_DEST="/usr/src/paperless/export"
 ```
 
----
+***
 
 ## Architektur
 
@@ -316,7 +328,7 @@ flock (Lock pro Remote)
   └── rclone sync → Cloud
 ```
 
----
+***
 
 ## Sicherheitshinweise
 
@@ -329,7 +341,7 @@ flock (Lock pro Remote)
 | Locks | Pro Remote ein eigener flock-Lock – verhindert parallele Ausführung |
 | Passphrase-Verlust | Backup ist **dauerhaft verloren** – extern sichern! |
 
----
+***
 
 ## Fehlerbehandlung & Exit-Codes
 
@@ -344,7 +356,7 @@ flock (Lock pro Remote)
 
 Bei jedem Fehler wird eine Telegram-Nachricht mit Exit-Code und betroffener Komponente gesendet.
 
----
+***
 
 ## Häufige Probleme
 
@@ -388,4 +400,21 @@ curl -s "https://api.telegram.org/bot<TOKEN>/sendMessage" \
 export BORG_PASSCOMMAND="cat /root/.borg_passphrase"
 borg check --repair /backup/paperless-borg
 # Wenn nicht reparierbar: Restore vom letzten funktionierenden Cloud-Backup
+```
+
+### `ERROR: cannot drop the currently open database`
+Der `DROP DATABASE`-Befehl darf nicht über die zu löschende Datenbank selbst laufen.
+Stattdessen über `postgres` verbinden:
+```bash
+docker exec db psql -U paperless -d postgres -c "DROP DATABASE paperless;"
+docker exec db psql -U paperless -d postgres -c "CREATE DATABASE paperless OWNER paperless;"
+```
+
+### `WARNING: collation version mismatch`
+Diese Warnung erscheint wenn die PostgreSQL-Collation-Version des Containers nicht mit
+der des Betriebssystems übereinstimmt. Sie ist **harmlos** und blockiert weder Backup
+noch Restore. Optional beheben mit:
+```bash
+docker exec db psql -U paperless -d postgres -c "ALTER DATABASE paperless REFRESH COLLATION VERSION;"
+docker exec db psql -U paperless -d postgres -c "ALTER DATABASE template1 REFRESH COLLATION VERSION;"
 ```
