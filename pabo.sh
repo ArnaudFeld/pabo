@@ -1,5 +1,5 @@
 #!/bin/bash
-# pabo.sh – PABO: Paperless-Borg Backup Orchestrator v1.0.3
+# pabo.sh – PABO: Paperless-Borg Backup Orchestrator v1.0.4
 # Automated, encrypted, multi-cloud backups for Paperless-ngx
 # powered by BorgBackup and rclone.
 # https://github.com/ArnaudFeld/pabo
@@ -99,7 +99,8 @@ validate_conf() {
   _check_int "${RCLONE_CHECKERS:-}"  "RCLONE_CHECKERS"
 
   # RCLONE_BWLIMIT: optional – leer = kein Limit, sonst z.B. "2M", "1.5M", "500K"
-  if [[ -n "${RCLONE_BWLIMIT:-}" ]] &&      [[ ! "${RCLONE_BWLIMIT}" =~ ^[0-9]+(\.[0-9]+)?[KMGkmg]?$ ]]; then
+  if [[ -n "${RCLONE_BWLIMIT:-}" ]] && \
+     [[ ! "${RCLONE_BWLIMIT}" =~ ^[0-9]+(\.[0-9]+)?[KMGkmg]?$ ]]; then
     echo "❌ Config: RCLONE_BWLIMIT ungültiges Format: '${RCLONE_BWLIMIT}' (erwartet z.B. 2M, 500K, leer)"
     errors=$(( errors + 1 ))
   fi
@@ -146,7 +147,7 @@ send_telegram() {
   jq -n \
     --arg cid  "${TELEGRAM_CHAT_ID}" \
     --arg text "$message" \
-    '{"chat_id":\$cid,"text":\$text,"parse_mode":"HTML"}' | \
+    '{"chat_id":$cid,"text":$text,"parse_mode":"HTML"}' | \
   curl -s --max-time 10 --connect-timeout 5 \
     -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
     -H "Content-Type: application/json" \
@@ -165,10 +166,6 @@ sanitize_remote_name() {
   echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g'
 }
 
-# H7-Info: validate_int wird aktuell nicht direkt aufgerufen (alle interaktiven
-# Eingaben nutzen prompt_int). Bleibt für nicht-interaktive Config-Validierung
-# erhalten, z.B. für künftige Prüfung von RCLONE_TRANSFERS beim Config-Laden.
-# M1-Fix: Regex ^[0-9]+$ – akzeptiert auch 0 als validen Wert
 validate_int() {
   local val="$1" min="$2" max="$3" label="$4"
   if [[ ! "$val" =~ ^[0-9]+$ ]] || (( val < min )) || (( val > max )); then
@@ -191,9 +188,6 @@ prompt_int() {
   done
 }
 
-# M1(neu)-HINWEIS: Identische Funktion existiert in LIB_FILE (für run_backup).
-# Bei Änderungen BEIDE Stellen aktualisieren (hier + COMMON-Heredoc in generate_scripts).
-# Borg 1.x: .cache.stats.unique_csize / Borg 2.x: .stats.unique_csize
 borg_repo_size() {
   local repo="$1"
   borg info --json "$repo" 2>/dev/null | jq -r '
@@ -207,21 +201,18 @@ borg_repo_size() {
 
 # ─────────────────────────────────────────────
 # H1-Fix: Alte Scripts und Timer sauber entfernen
-# Prüft auf laufende Prozesse, stoppt Timer, löscht Units + Scripts
 # ─────────────────────────────────────────────
 
 cleanup_old_scripts() {
   echo ""
   echo "🧹 Räume alte Scripts und Timer auf..."
 
-  # Laufende Backup-Prozesse prüfen – bei Fund Abbruch mit Meldung
   if pgrep -f "paperless-backup-" > /dev/null 2>&1; then
     echo "❌ Laufende Backup-Prozesse gefunden – bitte warten:"
     pgrep -a -f "paperless-backup-" || true
     exit 1
   fi
 
-  # Timer stoppen und deaktivieren
   local timer tname
   for timer in \
       /etc/systemd/system/paperless-backup-*.timer \
@@ -234,7 +225,6 @@ cleanup_old_scripts() {
     echo "   🛑 Timer gestoppt: ${tname}"
   done
 
-  # Alte pro-Ziel Backup-Scripts löschen
   local script
   for script in "${SCRIPT_DIR}"/paperless-backup-*.sh; do
     [[ -f "$script" ]] || continue
@@ -242,10 +232,6 @@ cleanup_old_scripts() {
     echo "   🗑 Script gelöscht: ${script}"
   done
 
-  # Alte Systemd-Units löschen (service + timer)
-  # H5-Info: Check- und Restore-Scripts werden ebenfalls entfernt und sofort
-  # neu generiert. Das kurze Fehl-Fenster dazwischen ist akzeptabel.
-  # Bei Bedarf: Phase 1 = nur zielabhängige Scripts, Phase 2 nach generate_scripts.
   local unit
   for unit in \
       /etc/systemd/system/paperless-backup-*.service \
@@ -270,10 +256,6 @@ cleanup_old_scripts() {
 run_setup() {
   if [[ $EUID -ne 0 ]]; then echo "❌ Bitte als root ausführen."; exit 1; fi
 
-  # H1-Fix: Setup-Modus erkennen
-  # Modus 0 = Ersteinrichtung (kein CONF_FILE)
-  # Modus 1 = Ziele ändern     (CONF_FILE vorhanden)
-  # Modus 2 = Nur neu generieren (CONF_FILE vorhanden, unverändert)
   local SETUP_MODE=0
   _SETUP_VARS_LOADED=1
 
@@ -307,7 +289,6 @@ run_setup() {
   echo "║     Paperless Backup Setup           ║"
   echo "╚══════════════════════════════════════╝"
 
-  # Modus 2: Nur neu generieren – direkt zu cleanup + generate
   if [[ $SETUP_MODE -eq 2 ]]; then
     cleanup_old_scripts
     generate_scripts
@@ -317,7 +298,6 @@ run_setup() {
     return
   fi
 
-  # Modus 0+1: Abhängigkeiten installieren
   echo ""
   echo "📦 Installiere Abhängigkeiten..."
   apt-get update -qq
@@ -372,14 +352,10 @@ run_setup() {
     echo "   ✅ Ziel ${t}: ${REMOTE_CLEAN}:${remote_path}"
   done
 
-  # Modus 1: Nur Ziele neu – restliche Config aus geladenem CONF_FILE behalten
   if [[ $SETUP_MODE -eq 1 ]]; then
-    # BACKUP_TARGETS in Config aktualisieren
     local tmp_conf
     tmp_conf=$(mktemp)
-    # B4-Fix: tmp_conf enthält Klartext-Token – bei Fehler sofort löschen
     trap 'rm -f "$tmp_conf"' EXIT
-    # Alles außer BACKUP_TARGETS-Block übernehmen, dann neues Array anhängen
     sed '/^BACKUP_TARGETS=($/,/^)$/d' "$CONF_FILE" > "$tmp_conf"
     {
       echo "BACKUP_TARGETS=("
@@ -389,7 +365,7 @@ run_setup() {
       echo ")"
     } >> "$tmp_conf"
     mv "$tmp_conf" "$CONF_FILE"
-    trap - EXIT  # tmp_conf erfolgreich ersetzt – trap nicht mehr nötig
+    trap - EXIT
     chmod 600 "$CONF_FILE"
     echo ""
     echo "✅ Ziele in ${CONF_FILE} aktualisiert."
@@ -404,8 +380,6 @@ run_setup() {
 📅 $(date '+%Y-%m-%d %H:%M')"
     return
   fi
-
-  # ── Ab hier nur Modus 0 (Ersteinrichtung) ──
 
   echo ""
   echo "🐳 Erkenne Docker-Container..."
@@ -445,7 +419,6 @@ run_setup() {
   detect_value "Borg Repository Pfad" "/backup/paperless-borg" BORG_REPO
   detect_value "Temporäres Backup-Verzeichnis" "/backup/paperless-tmp" BACKUP_TMP
 
-  # Warnung bei gleichem Filesystem
   MEDIA_FS=$(df --output=source "$MEDIA_DIR" 2>/dev/null | tail -1 || echo "")
   BORG_PARENT=$(dirname "$BORG_REPO")
   mkdir -p "$BORG_PARENT"
@@ -514,7 +487,7 @@ run_setup() {
   echo ""
   echo "💾 Speichere Konfiguration nach ${CONF_FILE}..."
   cat > "$CONF_FILE" <<EOF
-# PABO – Paperless-Borg Backup Orchestrator v1.0
+# PABO – Paperless-Borg Backup Orchestrator v1.0.4
 # Konfiguration erstellt: $(date '+%Y-%m-%d %H:%M:%S')
 
 PAPERLESS_CONTAINER="${PAPERLESS_CONTAINER}"
@@ -530,14 +503,11 @@ EXPORT_DIR="${EXPORT_DIR}"
 BORG_REPO="${BORG_REPO}"
 BACKUP_TMP="${BACKUP_TMP}"
 
-# H3-Fix: Bei Token-Rotation: paperless-setup.sh → Setup → Modus 2 (neu generieren)
-# oder diesen Wert manuell ersetzen und danach Modus 2 ausführen.
 TELEGRAM_TOKEN="${TELEGRAM_TOKEN}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID}"
 
 BACKUP_TARGETS=(
 $(
-  # N1(neu)-Fix: printf %q – Bash-sicheres Quoting für Sonderzeichen in Pfaden
   for t in "${BACKUP_TARGETS[@]}"; do
     printf "  %q\n" "$t"
   done
@@ -571,7 +541,6 @@ EOF
   echo "$BORG_PASSPHRASE" > /root/.borg_passphrase
   chmod 600 /root/.borg_passphrase
 
-  # REST-K3-Fix: Nur der Lesebefehl steht in /proc/<pid>/environ
   export BORG_PASSCOMMAND="cat /root/.borg_passphrase"
   borg init --encryption=repokey "$BORG_REPO"
 
@@ -621,22 +590,18 @@ EXIT_OK=0; EXIT_DB=10; EXIT_BORG=11; EXIT_RCLONE=12; EXIT_RESTORE=13; EXIT_RESTO
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"; }
 
-# K1-Fix: jq für JSON-Escaping / M4-Fix: curl Timeouts
 send_telegram() {
   local message="$1"
   jq -n \
     --arg cid  "${TELEGRAM_CHAT_ID}" \
     --arg text "$message" \
-    '{"chat_id":\$cid,"text":\$text,"parse_mode":"HTML"}' | \
+    '{"chat_id":$cid,"text":$text,"parse_mode":"HTML"}' | \
   curl -s --max-time 10 --connect-timeout 5 \
     -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
     -H "Content-Type: application/json" \
     --data-binary @- > /dev/null
 }
 
-# M1(neu)-HINWEIS: Identische Funktion im Haupt-Script (für run_status).
-# Bei Änderungen BEIDE Stellen aktualisieren.
-# Borg 1.x: .cache.stats.unique_csize / Borg 2.x: .stats.unique_csize
 borg_repo_size() {
   local repo="$1"
   borg info --json "$repo" 2>/dev/null | jq -r '
@@ -657,8 +622,6 @@ run_backup() {
   START_TIME=$(date +%s)
   local ARCHIVE_NAME="paperless-$(date +%Y-%m-%d-%H%M%S)"
 
-  # H2-Fix: Target-spezifischer Lock-Pfad – verhindert Archivname-Kollision
-  # bei gleichzeitigen Starts und macht Locks unabhängig voneinander
   local LOCK_SAFE
   LOCK_SAFE=$(echo "${REMOTE}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')
 
@@ -675,7 +638,6 @@ run_backup() {
       exit 0
     }
 
-    # REST-K3-Fix: Nur der Lesebefehl in Env, nicht die Passphrase
     export BORG_PASSCOMMAND="cat /root/.borg_passphrase"
 
     if [[ "${ENABLE_DOCUMENT_EXPORTER:-false}" == "true" && "$DRY_RUN" == "false" ]]; then
@@ -697,8 +659,6 @@ run_backup() {
     if [[ "$DRY_RUN" == "true" ]]; then
       log "[DB] DRY-RUN: Überspringe DB-Dump"
     else
-      # --clean --if-exists: DROPs Tabellen vor dem Einspielen
-      # REST-M4-Hinweis: Bei schwerer Korruption manuell DROP/CREATE DATABASE
       docker exec "${DB_CONTAINER}" pg_dump \
         --clean --if-exists \
         -U "${DB_USER}" "${DB_NAME}" \
@@ -809,7 +769,6 @@ COMMON
     REMOTE_NAME="${target%%:*}"
     SAFE_NAME=$(sanitize_remote_name "$REMOTE_NAME")
     SCRIPT_PATH="${SCRIPT_DIR}/paperless-backup-${SAFE_NAME}.sh"
-    # B1-Fix: printf %q verhindert Syntaxfehler bei Sonderzeichen im Pfad
     cat > "$SCRIPT_PATH" <<EOF
 #!/bin/bash
 LOG_FILE="${LOG_FILE}"
@@ -920,8 +879,6 @@ fi
   export BORG_PASSCOMMAND="cat /root/.borg_passphrase"
 
   mkdir -p "\${TEST_DIR}"
-  # K1(alt)-Fix: trap innerhalb der Subshell, nach mkdir
-  # Guard [[ -n TEST_DIR ]] verhindert rm -rf ""
   trap '[[ -n "\${TEST_DIR:-}" ]] && { log "Räume \${TEST_DIR} auf..."; rm -rf "\${TEST_DIR}"; }' EXIT
 
   log "=== Starte Restore Dry-Run Test ==="
@@ -938,10 +895,8 @@ fi
   fi
   log "Teste Archiv: \${LATEST_ARCHIVE}"
 
-  # cd nach trap – bei Fehler wird trap sauber ausgelöst und TEST_DIR bereinigt
   cd "\$TEST_DIR" || { log "❌ cd \${TEST_DIR} fehlgeschlagen – Abbruch"; exit 1; }
   log "Extrahiere nach \${TEST_DIR}..."
-  # M3-Fix: if/else statt || – zuverlässig unter set -euo pipefail
   if ! borg extract "\${BORG_REPO}::\${LATEST_ARCHIVE}" 2>&1 | tee -a "\$LOG_FILE"; then
     ERRORS+=("Borg-Extraktion fehlgeschlagen")
   fi
@@ -1098,7 +1053,6 @@ run_restore() {
   load_conf
   validate_conf
   check_passphrase
-  # N1-Info: BORG_PASSCOMMAND im äußeren Prozess – interaktiv, kein flock nötig
   export BORG_PASSCOMMAND="cat /root/.borg_passphrase"
 
   echo "╔══════════════════════════════════════╗"
@@ -1144,7 +1098,6 @@ run_restore() {
   local TARGET_PREFIX="/"
   if [[ "$restore_type" == "5" ]]; then
     read -rp "Ziel-Basisverzeichnis (z.B. /tmp/paperless-staging): " TARGET_PREFIX
-    # B2-Fix: mkdir-Fehler mit klarer Meldung abfangen statt stummen set -e Abbruch
     mkdir -p "$TARGET_PREFIX" || {
       echo "❌ Konnte Zielverzeichnis nicht erstellen: ${TARGET_PREFIX}"
       echo "   Bitte Pfad und Berechtigungen prüfen."
@@ -1166,7 +1119,7 @@ run_restore() {
     borg extract "${BORG_REPO}::${ARCHIVE_NAME}" \
       "${MEDIA_DIR#/}" || {
         send_telegram "❌ Restore fehlgeschlagen
-🔴 [MEDIA] borg extract
+🔴 Fehler: [MEDIA] borg extract
 🔢 Exit-Code: ${EXIT_RESTORE}"
         exit $EXIT_RESTORE
       }
@@ -1174,11 +1127,11 @@ run_restore() {
   fi
 
   if [[ "$restore_type" == "1" || "$restore_type" == "4" ]]; then
-    echo "📂 Stelle Data wieder her..."
+    echo "📁 Stelle Data wieder her..."
     borg extract "${BORG_REPO}::${ARCHIVE_NAME}" \
       "${DATA_DIR#/}" || {
         send_telegram "❌ Restore fehlgeschlagen
-🔴 [DATA] borg extract
+🔴 Fehler: [DATA] borg extract
 🔢 Exit-Code: ${EXIT_RESTORE}"
         exit $EXIT_RESTORE
       }
@@ -1189,32 +1142,28 @@ run_restore() {
     echo "📄 Stelle docker-compose.yml wieder her..."
     borg extract "${BORG_REPO}::${ARCHIVE_NAME}" \
       "${COMPOSE_FILE#/}" || {
-        echo "⚠️  docker-compose.yml konnte nicht wiederhergestellt werden"
+        echo "   ⚠️  docker-compose.yml konnte nicht wiederhergestellt werden"
       }
     echo "   ✅ docker-compose.yml wiederhergestellt"
   fi
 
   if [[ "$restore_type" == "1" || "$restore_type" == "2" ]]; then
-    echo "🗃️  Stelle Datenbank wieder her..."
-    # N2-Fix: Hinweis direkt hier sichtbar für den Operator.
-    # Das SQL enthält DROP/CREATE via --clean --if-exists (aus pg_dump).
-    # Bei schwerer DB-Korruption: Container stoppen, manuell
-    # DROP DATABASE / CREATE DATABASE durchführen, dann erneut restore.
+    echo "🗃 Stelle Datenbank wieder her..."
     borg extract --stdout "${BORG_REPO}::${ARCHIVE_NAME}" \
-      backup/paperless-tmp/paperless-db.sql | \
-      docker exec -i "${DB_CONTAINER}" psql -U "${DB_USER}" "${DB_NAME}" || {
-        send_telegram "❌ Restore fehlgeschlagen
-🔴 [DB] pg_restore
+      "backup/paperless-tmp/paperless-db.sql" | \
+    docker exec -i "${DB_CONTAINER}" psql -U "${DB_USER}" "${DB_NAME}" || {
+      send_telegram "❌ Restore fehlgeschlagen
+🔴 Fehler: [DB] psql restore
 🔢 Exit-Code: ${EXIT_RESTORE}"
-        exit $EXIT_RESTORE
-      }
+      exit $EXIT_RESTORE
+    }
     echo "   ✅ Datenbank wiederhergestellt"
   fi
 
   if [[ "$restore_type" == "1" && "$TARGET_PREFIX" == "/" ]]; then
     echo ""
-    echo "🚀 Starte Paperless..."
-    docker compose -f "$COMPOSE_FILE" up -d
+    echo "🐳 Starte Paperless..."
+    docker compose -f "${COMPOSE_FILE}" up -d
   fi
 
   echo ""
@@ -1222,107 +1171,11 @@ run_restore() {
   send_telegram "✅ Paperless Restore abgeschlossen
 🗄 Archiv: ${ARCHIVE_NAME}
 ☁️ Quelle: ${SELECTED_TARGET}
-📍 Ziel: ${TARGET_PREFIX}"
+📁 Ziel: ${TARGET_PREFIX}"
 }
 
 # ─────────────────────────────────────────────
-# KONFIG CHECK
-# ─────────────────────────────────────────────
-
-run_config_check() {
-  load_conf
-  validate_conf
-  check_passphrase
-  export BORG_PASSCOMMAND="cat /root/.borg_passphrase"
-
-  echo "╔══════════════════════════════════════╗"
-  echo "║     Paperless Konfig-Check           ║"
-  echo "╚══════════════════════════════════════╝"
-  echo ""
-
-  local ERRORS=0
-  check_ok()   { echo "   ✅ $*"; }
-  check_fail() { echo "   ❌ $*"; ERRORS=$(( ERRORS + 1 )); }
-  check_info() { echo "   ℹ️  $*"; }
-
-  echo "🐳 Docker Container:"
-  if docker ps --format '{{.Names}}' | grep -q "^${PAPERLESS_CONTAINER}$"; then
-    check_ok "Paperless Container läuft: ${PAPERLESS_CONTAINER}"
-  else
-    check_fail "Paperless Container nicht gefunden: ${PAPERLESS_CONTAINER}"
-  fi
-  if docker ps --format '{{.Names}}' | grep -q "^${DB_CONTAINER}$"; then
-    check_ok "DB Container läuft: ${DB_CONTAINER}"
-  else
-    check_fail "DB Container nicht gefunden: ${DB_CONTAINER}"
-  fi
-
-  echo ""
-  echo "☁️  rclone Remotes:"
-  local REMOTE_NAME
-  for target in "${BACKUP_TARGETS[@]}"; do
-    REMOTE_NAME="${target%%:*}"
-    if rclone listremotes | grep -q "^${REMOTE_NAME}:$"; then
-      check_ok "Remote vorhanden: ${REMOTE_NAME}"
-    else
-      check_fail "Remote fehlt: ${REMOTE_NAME}"
-    fi
-  done
-
-  echo ""
-  echo "🔒 Borg Repository:"
-  if borg info "${BORG_REPO}" > /dev/null 2>&1; then
-    check_ok "Repository erreichbar: ${BORG_REPO}"
-  else
-    check_fail "Repository nicht erreichbar: ${BORG_REPO}"
-  fi
-  if [[ -w "${BORG_REPO}" ]]; then
-    check_ok "Schreibrechte auf ${BORG_REPO}"
-  else
-    check_fail "Keine Schreibrechte auf ${BORG_REPO}"
-  fi
-
-  echo ""
-  echo "📂 Pfade:"
-  if [[ -d "${MEDIA_DIR}" ]]; then
-    check_ok "Media-Verzeichnis: ${MEDIA_DIR}"
-  else
-    check_fail "Media-Verzeichnis fehlt: ${MEDIA_DIR}"
-  fi
-  if [[ -d "${DATA_DIR}" ]]; then
-    check_ok "Data-Verzeichnis: ${DATA_DIR}"
-  else
-    check_fail "Data-Verzeichnis fehlt: ${DATA_DIR}"
-  fi
-  if [[ -f "${COMPOSE_FILE}" ]]; then
-    check_ok "docker-compose.yml: ${COMPOSE_FILE}"
-  else
-    check_fail "docker-compose.yml fehlt: ${COMPOSE_FILE}"
-  fi
-  if [[ -w "${BACKUP_TMP}" ]]; then
-    check_ok "Schreibrechte auf ${BACKUP_TMP}"
-  else
-    check_fail "Keine Schreibrechte auf ${BACKUP_TMP}"
-  fi
-
-  echo ""
-  echo "📦 Versionen:"
-  check_info "$(borg --version)"
-  check_info "$(rclone --version | head -1)"
-  check_info "$(docker --version)"
-  check_info "jq $(jq --version)"
-
-  echo ""
-  if [[ $ERRORS -eq 0 ]]; then
-    echo "✅ Alle Checks bestanden – System bereit."
-  else
-    echo "❌ ${ERRORS} Check(s) fehlgeschlagen – bitte beheben!"
-    exit 1
-  fi
-}
-
-# ─────────────────────────────────────────────
-# TEST
+# TEST / STATUS / CONFIG-CHECK
 # ─────────────────────────────────────────────
 
 run_test() {
@@ -1337,22 +1190,22 @@ run_test() {
     idx=$(( idx + 1 ))
   done
   echo "  ${idx}) Backup Dry-Run (Ziel auswählen)"
-  local DRYRUN_IDX=$idx; idx=$(( idx + 1 ))
+  local DRY_RUN_IDX=$idx; idx=$(( idx + 1 ))
   echo "  ${idx}) Borg Check"
-  local BORGCHECK_IDX=$idx; idx=$(( idx + 1 ))
+  local BORG_CHECK_IDX=$idx; idx=$(( idx + 1 ))
   echo "  ${idx}) Restore Dry-Run Test"
-  local RESTORETEST_IDX=$idx
+  local RESTORE_TEST_IDX=$idx
   local MAX_IDX=$idx
 
   local choice
-  prompt_int "Auswahl: " 1 "$MAX_IDX" choice
+  prompt_int "Auswahl: " 1 $MAX_IDX choice
 
   local REMOTE_NAME SAFE_NAME
   if (( choice <= ${#BACKUP_TARGETS[@]} )); then
     REMOTE_NAME="${BACKUP_TARGETS[$((choice-1))]%%:*}"
     SAFE_NAME=$(sanitize_remote_name "$REMOTE_NAME")
     bash "${SCRIPT_DIR}/paperless-backup-${SAFE_NAME}.sh"
-  elif [[ "$choice" -eq "$DRYRUN_IDX" ]]; then
+  elif [[ "$choice" -eq "$DRY_RUN_IDX" ]]; then
     echo ""
     echo "Dry-Run für welches Ziel?"
     for i in "${!BACKUP_TARGETS[@]}"; do
@@ -1361,22 +1214,15 @@ run_test() {
     local dry_idx
     prompt_int "Auswahl: " 1 "${#BACKUP_TARGETS[@]}" dry_idx
     local DRY_TARGET="${BACKUP_TARGETS[$((dry_idx-1))]}"
-    # M2(neu)-Fix: LOG_FILE exportieren – stellt sicher dass run_backup den
-    # richtigen Wert nutzt, auch wenn source "$LIB_FILE" ihn neu setzt
-    export LOG_FILE
     # shellcheck source=/dev/null
     source "$LIB_FILE"
-    run_backup "$DRY_TARGET" "true"
-  elif [[ "$choice" -eq "$BORGCHECK_IDX" ]]; then
+    run_backup "$DRY_TARGET" true
+  elif [[ "$choice" -eq "$BORG_CHECK_IDX" ]]; then
     bash "${SCRIPT_DIR}/paperless-borg-check.sh"
-  elif [[ "$choice" -eq "$RESTORETEST_IDX" ]]; then
+  elif [[ "$choice" -eq "$RESTORE_TEST_IDX" ]]; then
     bash "${SCRIPT_DIR}/paperless-restore-test.sh"
   fi
 }
-
-# ─────────────────────────────────────────────
-# STATUS
-# ─────────────────────────────────────────────
 
 run_status() {
   load_conf
@@ -1384,6 +1230,7 @@ run_status() {
   check_passphrase
   export BORG_PASSCOMMAND="cat /root/.borg_passphrase"
 
+  echo ""
   echo "╔══════════════════════════════════════╗"
   echo "║     Paperless Backup Status          ║"
   echo "╚══════════════════════════════════════╝"
@@ -1391,18 +1238,19 @@ run_status() {
   echo ""
   echo "🐳 Docker Container:"
   docker ps --format "table {{.Names}}\t{{.Status}}" \
-    | grep -iE "paperless|redis|tika|gotenberg" || echo "   (keine gefunden)"
+    | grep -iE "paperless|redis|tika|gotenberg" || echo "   keine gefunden"
 
   echo ""
   echo "⏰ Systemd Timer:"
-  systemctl list-timers --no-pager | grep paperless || echo "   (keine aktiven Timer)"
+  systemctl list-timers --no-pager | grep paperless || echo "   keine aktiven Timer"
 
   echo ""
   echo "📦 Borg Archive (letzte 5):"
-  borg list "${BORG_REPO}" 2>/dev/null | tail -5 || echo "   (nicht verfügbar)"
+  borg list "${BORG_REPO}" 2>/dev/null | tail -5 || echo "   nicht verfügbar"
 
   echo ""
-  echo "💾 Repository Größe: $(borg_repo_size "${BORG_REPO}")"
+  echo "💾 Repository-Größe:"
+  borg_repo_size "${BORG_REPO}"
 
   echo ""
   echo "☁️  Cloud-Ziele:"
@@ -1412,45 +1260,87 @@ run_status() {
 
   echo ""
   echo "📋 Letzte Backup-Logs:"
-  tail -5 "$LOG_FILE" 2>/dev/null || echo "   (keine Logs)"
+  tail -5 "${LOG_FILE}" 2>/dev/null || echo "   keine Logs"
 
   echo ""
-  echo "📋 Letzter Borg Check:"
-  tail -3 "$BORG_CHECK_LOG" 2>/dev/null || echo "   (noch kein Check gelaufen)"
+  echo "🔍 Letzter Borg Check:"
+  tail -3 "${BORG_CHECK_LOG}" 2>/dev/null || echo "   noch kein Check gelaufen"
 
   echo ""
-  echo "📋 Letzter Restore-Test:"
-  tail -3 "$RESTORE_TEST_LOG" 2>/dev/null || echo "   (noch kein Test gelaufen)"
+  echo "🧪 Letzter Restore-Test:"
+  tail -3 "${RESTORE_TEST_LOG}" 2>/dev/null || echo "   noch kein Test gelaufen"
+}
+
+run_config_check() {
+  load_conf
+  validate_conf
+  check_passphrase
+  export BORG_PASSCOMMAND="cat /root/.borg_passphrase"
+
+  local ERRORS=0
+  check_ok()   { echo "   ✅ $*"; }
+  check_fail() { echo "   ❌ $*"; ERRORS=$(( ERRORS + 1 )); }
+  check_info() { echo "   ℹ️  $*"; }
+
+  echo ""
+  echo "╔══════════════════════════════════════╗"
+  echo "║     Paperless Config-Check           ║"
+  echo "╚══════════════════════════════════════╝"
+
+  echo ""
+  echo "📂 Pfade:"
+  [[ -d "$MEDIA_DIR"  ]] && check_ok  "Media-Verzeichnis: ${MEDIA_DIR}"  || check_fail "Media-Verzeichnis fehlt: ${MEDIA_DIR}"
+  [[ -d "$DATA_DIR"   ]] && check_ok  "Data-Verzeichnis: ${DATA_DIR}"    || check_fail "Data-Verzeichnis fehlt: ${DATA_DIR}"
+  [[ -f "$COMPOSE_FILE" ]] && check_ok "docker-compose.yml: ${COMPOSE_FILE}" || check_fail "docker-compose.yml fehlt: ${COMPOSE_FILE}"
+  [[ -w "$BACKUP_TMP" ]] && check_ok  "Schreibrechte auf ${BACKUP_TMP}" || check_fail "Keine Schreibrechte auf ${BACKUP_TMP}"
+
+  echo ""
+  echo "🔧 Versionen:"
+  check_info "$(borg --version)"
+  check_info "$(rclone --version | head -1)"
+  check_info "$(docker --version)"
+  check_info "jq $(jq --version)"
+
+  echo ""
+  if (( ERRORS == 0 )); then
+    echo "✅ Alle Checks bestanden – System bereit."
+  else
+    echo "❌ ${ERRORS} Checks fehlgeschlagen – bitte beheben!"
+    exit 1
+  fi
 }
 
 # ─────────────────────────────────────────────
-# MAIN
+# MAIN MENU
 # ─────────────────────────────────────────────
 
 echo ""
-echo "╔══════════════════════════════════════════════════╗"
-echo "║  ██████╗  █████╗ ██████╗  ██████╗               ║"
-echo "║  ██╔══██╗██╔══██╗██╔══██╗██╔═══██╗              ║"
-echo "║  ██████╔╝███████║██████╔╝██║   ██║              ║"
-echo "║  ██╔═══╝ ██╔══██║██╔══██╗██║   ██║              ║"
-echo "║  ██║     ██║  ██║██████╔╝╚██████╔╝              ║"
-echo "║  ╚═╝     ╚═╝  ╚═╝╚═════╝  ╚═════╝  v1.0.3       ║"
-echo "║  Paperless-Borg Backup Orchestrator              ║"
-echo "╚══════════════════════════════════════════════════╝"
+echo "╔══════════════════════════════════════════════╗"
+echo "║  ██████╗  █████╗ ██████╗  ██████╗           ║"
+echo "║  ██╔══██╗██╔══██╗██╔══██╗██╔═══██╗          ║"
+echo "║  ██████╔╝███████║██████╔╝██║   ██║          ║"
+echo "║  ██╔═══╝ ██╔══██║██╔══██╗██║   ██║          ║"
+echo "║  ██║     ██║  ██║██████╔╝╚██████╔╝          ║"
+echo "║  ╚═╝     ╚═╝  ╚═╝╚═════╝  ╚═════╝  v1.0.4      ║"
+echo "║  Paperless-Borg Backup Orchestrator          ║"
+echo "╚══════════════════════════════════════════════╝"
 echo ""
-echo "  1) setup        – Ersteinrichtung / Ziele ändern"
+echo "Was möchtest du tun?"
+echo "  1) setup        – Einrichtung / Ziele ändern"
 echo "  2) restore      – Daten wiederherstellen"
-echo "  3) test         – Manuellen Test starten"
-echo "  4) status       – System-Status anzeigen"
+echo "  3) test         – Backup / Check / Restore-Test manuell starten"
+echo "  4) status       – Systemübersicht"
 echo "  5) config-check – Konfiguration prüfen"
+echo "  6) exit"
 echo ""
-read -rp "Aktion wählen (1-5): " action
 
-case "$action" in
-  1|setup)        run_setup ;;
-  2|restore)      run_restore ;;
-  3|test)         run_test ;;
-  4|status)       run_status ;;
-  5|config-check) run_config_check ;;
-  *) echo "Ungültige Auswahl." ; exit 1 ;;
+prompt_int "Auswahl (1-6): " 1 6 MAIN_CHOICE
+
+case "$MAIN_CHOICE" in
+  1) run_setup ;;
+  2) run_restore ;;
+  3) run_test ;;
+  4) run_status ;;
+  5) run_config_check ;;
+  6) exit 0 ;;
 esac
