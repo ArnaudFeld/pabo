@@ -3,6 +3,40 @@
 All notable changes to PABO will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [1.0.5] – 2026-04-19
+
+### Fixed
+- **BrokenPipeError during DB restore** (`run_restore`, types 1 and 2):
+  `borg extract --stdout … | docker exec -i … psql` caused a `BrokenPipeError`
+  with Borg 1.4+ because Borg writes the archive index to stdout alongside the
+  file content, which confuses the psql pipe. Fixed by extracting the SQL dump
+  into a `mktemp -d` directory first, then feeding it to psql via
+  `psql < file` redirect.
+- **`getwd: no such file or directory` after DB restore**:
+  After the DB tmpdir was cleaned up via `trap … RETURN`, the shell's current
+  working directory pointed into the now-deleted tmpdir, causing Docker Compose
+  to fail with `getwd: no such file or directory` when trying to start Paperless.
+  Fixed by saving `$PWD` into `PREV_DIR` before `cd "$DB_TMP"` and restoring it
+  with `cd "$PREV_DIR"` after cleanup.
+
+---
+
+## [1.0.4] – 2026-04-19
+
+### Changed
+- **Simplified heredoc structure in `generate_scripts()`**: Removed legacy
+  comment blocks and redundant inline annotations that were carried over from
+  earlier versions, improving readability of the generated scripts.
+- **Config header updated to v1.0.4**: The comment written to
+  `/etc/paperless-backup.conf` during setup now reflects the correct version.
+
+### Fixed
+- **Minor quoting inconsistencies in `validate_conf()`**: Regex patterns for
+  `_check_path` and `_check_name` aligned across all call sites to prevent
+  false-positive validation errors on valid paths containing dots or hyphens.
+
+---
+
 ## [1.0.3] – 2026-03-29
 
 ### Fixed
@@ -40,7 +74,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `RESTORETEST` heredocs (both unquoted `<<BORGCHECK` / `<<RESTORETEST`), single quotes
   do not suppress shell expansion. The jq argument `$cid` and `$text` were being
   expanded by the shell at heredoc-write time instead of being written literally into
-  the generated scripts. Fixed by escaping both variables as `\\$cid` and `\\$text`
+  the generated scripts. Fixed by escaping both variables as `\\\\$cid` and `\\\\$text`
   inside the affected heredocs, so the generated scripts receive the correct literal
   `$cid` / `$text` jq variable references.
 
