@@ -1,72 +1,65 @@
-[🇩🇪 Deutsch](README.md) | 🇬🇧 English
-
-***
+[Deutsch](README.md) | English
 
 # PABO – Paperless-Borg Backup Orchestrator
 
-**PABO** (*Paperless-Borg Backup Orchestrator*) is a fully automated backup solution for [Paperless-ngx](https://github.com/paperless-ngx/paperless-ngx) – powered by [BorgBackup](https://borgbackup.readthedocs.io/) and [rclone](https://rclone.org/). Supports multiple simultaneous cloud targets, encrypted local backups, automatic integrity checks, and weekly restore dry-runs.
+PABO (Paperless-Borg Backup Orchestrator) backs up a Paperless-ngx instance automatically. Data goes encrypted into a local Borg repository, then out to any number of cloud targets via rclone. A weekly integrity check, a weekly restore test and Telegram messages are part of it.
 
 ## Background
 
-I've been running my own [Paperless-ngx](https://github.com/paperless-ngx/paperless-ngx) instance for years, and over time it grew into something I really depend on. At some point a simple `cp` wasn't good enough anymore – I wanted something that runs automatically, stores backups encrypted, and can actually be restored when things go wrong.
-
-I came across BorgBackup through talks from the CCC community. The combination of deduplication, encryption, and efficiency convinced me. PABO is the result: a script that does exactly what I need for my instance – nothing more, nothing less.
-
-***
+I have run my own Paperless-ngx instance for years. Once it had grown, plain `cp` was no longer enough: backups had to run on their own, store data encrypted, and restore for real when it counts. I first heard about BorgBackup in talks from the CCC community. Deduplication, encryption and efficiency convinced me. PABO is the script that came out of it.
 
 ## Table of Contents
 
 - [Features](#features)
 - [Requirements](#requirements)
 - [Installation](#installation)
-- [Initial Setup](#initial-setup)
-- [Daily Operations](#daily-operations)
-- [Manual Actions](#manual-actions)
+- [Initial setup](#initial-setup)
+- [Daily operations](#daily-operations)
+- [Manual actions](#manual-actions)
 - [Restore](#restore)
-- [Configuration Reference](#configuration-reference)
+- [Configuration reference](#configuration-reference)
 - [Architecture](#architecture)
 - [Security](#security)
-- [Error Handling & Exit Codes](#error-handling--exit-codes)
+- [Error handling & exit codes](#error-handling--exit-codes)
 - [Troubleshooting](#troubleshooting)
-
-***
 
 ## Features
 
-| Feature | Details |
+| Area | Behavior |
 |---|---|
-| 🔐 Encryption | AES-256 via BorgBackup `repokey` |
-| ☁️ Multi-Cloud | Any number of rclone remotes simultaneously |
-| 🗄️ Database | PostgreSQL dump via `pg_dump --clean --if-exists` |
-| 📦 Deduplication | Borg-native deduplication + LZ4 compression |
-| 🔁 Retention | 14 daily / 8 weekly / 6 monthly |
-| ✅ Integrity check | Weekly `borg check --verify-data` |
-| 🧪 Restore test | Weekly automated dry-run |
-| 📱 Notifications | Telegram on success and failure |
-| ⏰ Automation | Systemd timers (no cron required) |
-
-***
+| Encryption | AES-256 via BorgBackup `repokey` |
+| Cloud targets | One archive per run, then one upload per rclone remote |
+| Database | PostgreSQL dump with `pg_dump --clean --if-exists` |
+| Deduplication | Native to Borg, LZ4 compression |
+| Retention | 14 daily, 8 weekly, 6 monthly |
+| Upload guard | Preflight plus `--max-delete` before every `rclone sync` |
+| Space guard | Abort before `borg create` when less than `BACKUP_MIN_FREE_MB` is free (default 4096 MB) |
+| Integrity check | `borg check --verify-data`, weekly |
+| Restore test | Weekly dry-run |
+| Notifications | Telegram on success and failure |
+| Timers | systemd, no cron needed |
 
 ## Requirements
 
 ### System
-- Debian/Ubuntu-based Linux (apt is used)
-- Docker + Docker Compose
+
+- Debian- or Ubuntu-based Linux (apt is used)
+- Docker and Docker Compose
 - Root access
 
-### Software (installed automatically)
-- `borgbackup` ≥ 1.4
+### Software
+
+The setup installs these on its own:
+
+- `borgbackup` 1.4 or newer
 - `rclone`
 - `jq`
 - `curl`
 - `postgresql-client`
 
-### Cloud Storage
-At least one configured rclone remote. If none exists, the setup wizard will launch `rclone config` automatically.
+### Cloud storage
 
-Supported providers (selection): Google Drive, Dropbox, S3, Backblaze B2, OneDrive, SFTP, WebDAV – [all rclone remotes](https://rclone.org/overview/).
-
-***
+At least one configured rclone remote is needed. If none exists, the setup starts `rclone config` on its own. All rclone remotes are supported, including Google Drive, Dropbox, S3, Backblaze B2, OneDrive, SFTP and WebDAV.
 
 ## Installation
 
@@ -85,58 +78,58 @@ chmod 755 /opt/pabo/pabo.sh
 cd /opt/pabo && git pull
 ```
 
-***
+### Upgrading from 1.0.5 to 1.1.0
 
-## Initial Setup
+1. Fetch the new version:
+
+```bash
+cd /opt/pabo && git pull
+```
+
+2. Start setup and pick mode 2 (regenerate scripts and timers). It removes the old per-target scripts and timers and creates the new layout; configuration, Borg repository and passphrase stay untouched.
+3. Run `config-check`. Two new keys get automatic defaults (`RCLONE_MAX_DELETE=500`, `BACKUP_MIN_FREE_MB=4096`); to change them, edit `/etc/paperless-backup.conf` or re-run target setup via mode 1.
+
+Four behavior changes affect existing installations. Validation is stricter than before: paths with spaces, `..` or double slashes, and a bot token that does not look like `<id>:<token>`, abort the run now. Exit code 10 additionally reports aborts from missing containers or low disk space. There is only one backup timer for all targets instead of one timer per target. After a restore, the script asks whether to delete the downloaded repository in `/backup/restore-repo`.
+
+## Initial setup
 
 ```bash
 sudo pabo.sh
 # → Select menu item 1) setup
 ```
 
-The setup wizard walks through the following steps:
+The wizard asks for input in this order:
 
-1. **Install dependencies** – borgbackup, rclone, jq, curl, postgresql-client
-2. **Detect rclone remotes** – or launch `rclone config` if none found
-3. **Select cloud targets** – one or more remotes + destination path
-4. **Detect Docker containers** – Paperless + PostgreSQL auto-detected
-5. **Confirm paths** – media, data, export, compose file
-6. **Filesystem warning** – if Borg repo is on the same disk as your data
-7. **Configure Telegram** – bot token + chat ID
-8. **rclone options** – bandwidth limit, parallel transfers
-9. **Borg excludes** – logs, NLTK data, temp files
-10. **Initialize Borg repository** – AES-256 encrypted
-11. **Display passphrase** – **must be stored externally!**
-12. **Set up systemd timers** – automated operation starts immediately
+1. Install dependencies
+2. Detect rclone remotes or create new ones
+3. Pick cloud targets (remote plus destination path, several allowed)
+4. Detect Docker containers (Paperless and PostgreSQL)
+5. Confirm paths (media, data, export, compose file)
+6. Warn if Borg repo and data sit on the same disk
+7. Configure Telegram (bot token and chat ID)
+8. rclone options (bandwidth limit, transfers, checkers, delete limit, minimum free space)
+9. Borg excludes (logs, NLTK data, temp files)
+10. Initialize Borg repository (AES-256)
+11. Show the passphrase and store it externally
+12. Set up systemd timers; from there everything runs on its own
 
-### ⚠️ Save your passphrase
+Input is validated on the spot; the wizard rejects invalid values and asks again. If the Borg repository already exists, it and the passphrase stay untouched.
 
-After setup, a random passphrase is generated and stored in `/root/.borg_passphrase`. This file is the only key to the Borg repository.
+### Save the passphrase
 
-```
-┌─────────────────────────────────────────┐
-│  ⚠️  BORG PASSPHRASE – KEEP IT SAFE      │
-│  xK9mP2...                              │
-│  Stored at: /root/.borg_passphrase      │
-│  → back up externally!                  │
-└─────────────────────────────────────────┘
-```
+Setup stores the passphrase in `/root/.borg_passphrase` (root only, mode 600) and shows it once in the terminal. Without it the repository stays unreadable for good. Keep it in a password manager (Bitwarden, 1Password, KeePass) or print it and store it away from the server.
 
-**Recommendation:** Store the passphrase in a password manager (Bitwarden, 1Password, KeePass) or in print at a secure location.
+## Daily operations
 
-***
-
-## Daily Operations
-
-After setup, everything runs automatically via systemd timers:
+After setup, everything runs on systemd timers:
 
 | Timer | Schedule | Action |
 |---|---|---|
-| `paperless-backup-<remote>.timer` | Daily at 02:00 | Backup + upload |
-| `paperless-borg-check.timer` | Sundays | Borg integrity check |
-| `paperless-restore-test.timer` | Sundays | Automated restore test |
+| `paperless-backup.timer` | Daily at 02:00 | Create one archive, upload to all targets |
+| `paperless-borg-check.timer` | Sundays at 03:00 | Borg integrity check |
+| `paperless-restore-test.timer` | Sundays at 04:00 | Automated restore test |
 
-With multiple cloud targets, backup timers are automatically staggered (02:00, 02:30, 03:00, …).
+All timers carry `RandomizedDelaySec=900`, so they start up to 15 minutes after the scheduled time. The services run without a time limit (`TimeoutStartSec=infinity`) because a backup can take longer than the systemd default of 90 seconds.
 
 ### Check timer status
 
@@ -157,40 +150,26 @@ tail -50 /var/log/paperless-borg-check.log
 tail -50 /var/log/paperless-restore-test.log
 
 # Systemd journal
-journalctl -u paperless-backup-<remote>.service -n 50
+journalctl -u paperless-backup.service -n 50
 ```
 
-***
-
-## Manual Actions
+## Manual actions
 
 ```bash
 sudo pabo.sh
 ```
 
-| Menu item | Action |
-|---|---|
-| `1) setup` | Initial setup or change targets |
-| `2) restore` | Interactive restore wizard |
-| `3) test` | Manually trigger backup/check/restore test |
-| `4) status` | System overview (containers, timers, archives, logs) |
-| `5) config-check` | Validate configuration and reachability |
+The menu offers setup (first setup or change targets), restore (interactive wizard), test (start a backup, check or restore test by hand), status (overview of containers, timers, archives and logs) and config-check (validate the configuration and reachability).
 
-### Setup modes (with existing configuration)
+The test submenu holds a real backup, a dry-run, a plain upload to a single target, the Borg check and the restore dry-run test.
 
-When running `setup` with an existing `/etc/paperless-backup.conf`:
+With an existing `/etc/paperless-backup.conf`, setup has two modes: mode 1 changes only the cloud targets and leaves Borg repo and passphrase alone; mode 2 regenerates scripts and timers and does not touch the config.
 
-- **Mode 1 – Change targets:** Configure new cloud targets, Borg and passphrase remain untouched
-- **Mode 2 – Regenerate:** Recreate scripts and timers without any other changes
-
-### Rotating the Telegram token
+A rotated Telegram token goes into the config by hand; then regenerate scripts and timers:
 
 ```bash
-# Manually replace TELEGRAM_TOKEN in /etc/paperless-backup.conf, then:
-sudo pabo.sh  # → 1) setup → 2) Regenerate only
+sudo pabo.sh  # → 1) setup → 2)
 ```
-
-***
 
 ## Restore
 
@@ -199,15 +178,17 @@ sudo pabo.sh
 # → Select menu item 2) restore
 ```
 
-The wizard offers the following restore options:
+The wizard asks for cloud target and archive first, then for the restore type: full restore (media, data, docker-compose.yml and database), database only, media only, data only, or staging into an alternative directory that leaves the running system alone.
 
-| Option | Description |
-|---|---|
-| 1) Full restore | Media + Data + docker-compose.yml + database |
-| 2) Database only | Restore PostgreSQL dump only |
-| 3) Media only | Restore document files only |
-| 4) Data only | Restore Paperless data directory only |
-| 5) Staging | Restore to an alternative directory (non-destructive) |
+The procedure:
+
+1. Free-space preflight: the remote is measured with `rclone size`; the download only starts once repo size times 1.1 is free.
+2. Download of the repository from the cloud to `/backup/restore-repo`; the live repository at `BORG_REPO` stays untouched.
+3. `borg check` against the downloaded repository.
+4. Archive selection; the name has to appear in the archive list.
+5. When restoring to `/`, the archive name has to be entered a second time for confirmation.
+6. The Paperless container is stopped before extraction and started again afterwards.
+7. A question whether the downloaded restore repo should stay; the default is to delete it.
 
 ### Manual restore after total system loss
 
@@ -220,34 +201,32 @@ echo "YOUR_PASSPHRASE" > /root/.borg_passphrase
 chmod 600 /root/.borg_passphrase
 
 # 3. Download Borg repo from cloud
-rclone sync gdrive:/Paperless-Borg-Encrypted /backup/paperless-borg
+rclone copy gdrive:/Paperless-Borg-Encrypted /backup/restore-repo
 
 # 4. List available archives
 export BORG_PASSCOMMAND="cat /root/.borg_passphrase"
-borg list /backup/paperless-borg
+borg list /backup/restore-repo
 
 # 5. Start restore
 sudo pabo.sh  # → 2) restore
 ```
 
-> **Note on severe database corruption:** If `psql` fails during restore, the database
-> must first be dropped and recreated manually. Important: the `DROP` command must be
-> run against the `postgres` database, not `paperless` (otherwise:
-> `cannot drop the currently open database`):
->
-> ```bash
-> docker exec db psql -U paperless -d postgres -c "DROP DATABASE paperless;"
-> docker exec db psql -U paperless -d postgres -c "CREATE DATABASE paperless OWNER paperless;"
-> ```
->
-> A `collation version mismatch` warning during the connection is harmless and can be
-> ignored – it only affects internal sort metadata and does not block the restore.
+### Empty the database manually
 
-***
+The restore feeds the dump through `psql` with `ON_ERROR_STOP` and stops at the first SQL error; there is no silent partial restore. If applying the dump fails, empty the database by hand first. The `DROP` command has to run against the `postgres` database, not `paperless`:
 
-## Configuration Reference
+```bash
+docker exec db psql -U paperless -d postgres -c "DROP DATABASE paperless;"
+docker exec db psql -U paperless -d postgres -c "CREATE DATABASE paperless OWNER paperless;"
+```
 
-The configuration is stored in `/etc/paperless-backup.conf` (chmod 600, root-only).
+The `collation version mismatch` warning on connect concerns internal sort metadata only and blocks neither backup nor restore.
+
+## Configuration reference
+
+The configuration lives in `/etc/paperless-backup.conf` and is readable only by root (mode 600).
+
+The file is read line by line as text, never executed as shell code. Every key sits on a whitelist, every value is checked against a fixed pattern; anything unknown or invalid aborts the run. That sets the limits: no spaces, no `..` and no double slashes in paths; the bot token has to look like `<id>:<token>` and the chat ID has to be an integer.
 
 ```bash
 # PABO – Paperless Backup Configuration
@@ -277,6 +256,8 @@ BACKUP_TARGETS=(
 RCLONE_BWLIMIT="2M"                        # Empty = no limit, e.g. "2M", "500K"
 RCLONE_TRANSFERS="4"
 RCLONE_CHECKERS="8"
+RCLONE_MAX_DELETE="500"                    # Safety net for rclone sync
+BACKUP_MIN_FREE_MB="4096"                  # Minimum free space in MB, otherwise abort
 
 BORG_EXCLUDES=(
   "/data/paperless/data/log"
@@ -290,111 +271,135 @@ ENABLE_DOCUMENT_EXPORTER="false"           # true = run document_exporter before
 EXPORTER_DEST="/usr/src/paperless/export"
 ```
 
-***
-
 ## Architecture
 
 ```
 pabo.sh
 │
-├── /etc/paperless-backup.conf          ← Central configuration (chmod 600)
+├── /etc/paperless-backup.conf          ← Central configuration (chmod 600, read as data)
 ├── /root/.borg_passphrase              ← Borg passphrase (chmod 600)
+├── /run/pabo/                          ← Locks (chmod 700, root only)
 │
 ├── /usr/local/lib/
-│   └── paperless-backup-common.sh     ← Shared library (run_backup, send_telegram, …)
+│   └── paperless-backup-common.sh     ← Shared library, extracted from pabo.sh
 │
 ├── /usr/local/bin/
-│   ├── paperless-backup-<remote>.sh   ← One script per cloud target
+│   ├── paperless-backup.sh            ← Daily: archive + upload to all targets
 │   ├── paperless-borg-check.sh        ← Weekly integrity check
 │   └── paperless-restore-test.sh      ← Weekly restore dry-run
 │
 └── /etc/systemd/system/
-    ├── paperless-backup-<remote>.{service,timer}
+    ├── paperless-backup.{service,timer}
     ├── paperless-borg-check.{service,timer}
     └── paperless-restore-test.{service,timer}
 ```
 
-### Backup flow per target
+The three scripts in `/usr/local/bin` hold only the call and the log path; the logic lives once in the library, which the setup extracts from `pabo.sh`.
+
+### Backup flow
 
 ```
-flock (lock per remote)
+flock (/run/pabo/backup.lock)
   │
+  ├── Space check (BACKUP_MIN_FREE_MB, default 4096 MB)
+  ├── Container check (Paperless and database running?)
   ├── [optional] document_exporter
-  ├── pg_dump → /backup/paperless-tmp/paperless-db.sql
+  ├── pg_dump → $BACKUP_TMP/paperless-db.sql (chmod 600, removed afterwards)
   ├── borg create (media + data + DB dump + compose.yml)
   ├── borg prune (14d/8w/6m)
   ├── borg compact
-  └── rclone sync → cloud
+  └── per target:
+        ├── preflight: config + archives + segments present?
+        └── rclone sync --max-delete → cloud
 ```
-
-***
 
 ## Security
 
-| Aspect | Measure |
+| Area | Behavior |
 |---|---|
-| Encryption | AES-256 `repokey` – data in the cloud is unreadable without the passphrase |
-| Config protection | `/etc/paperless-backup.conf` chmod 600, root-only |
-| Passphrase | Only a read command in the environment (`BORG_PASSCOMMAND`), never plaintext |
-| Telegram | Bot token in config – if compromised, rotate via @BotFather + run Mode 2 |
-| Locks | One flock lock per remote – prevents parallel execution |
-| Passphrase loss | Backup is **permanently lost** – store it externally! |
+| Encryption | AES-256 via `repokey`; without the passphrase the cloud data is unreadable |
+| Configuration | Root only, read as text and checked against patterns |
+| Passphrase | Only a read command in the environment (`BORG_PASSCOMMAND`), never plaintext; the file is checked before every use (present, not a symlink, owned by root, mode 600) |
+| Telegram | Token lives in a config with mode 600, not on the command line; an outage never aborts a backup, the failure is only logged; if compromised, rotate via @BotFather and regenerate the scripts |
+| Locks | `/run/pabo` with mode 700, not the world-writable `/var/lock` |
+| Upload guard | Preflight plus `--max-delete` before every `rclone sync`; an empty or unmounted repo deletes nothing in the cloud |
+| Space guard | Abort before `borg create` below `BACKUP_MIN_FREE_MB` of free space (default 4096 MB); restore test needs archive size times 1.2, restore download needs repo size times 1.1 |
+| Restore | Download into a separate directory, archive name checked against the list, container stopped, target `/` requires confirmation |
+| Secrets | `umask 077` throughout the script, PostgreSQL dump with mode 600, removed afterwards |
+| Passphrase loss | Without it the backup is lost for good, store it externally |
 
-***
-
-## Error Handling & Exit Codes
+## Error handling & exit codes
 
 | Code | Meaning |
 |---|---|
 | 0 | Success |
-| 10 | PostgreSQL dump failed |
+| 10 | Backup aborted (DB dump, missing container or low disk space) |
 | 11 | Borg create/check failed |
-| 12 | rclone upload failed |
+| 12 | rclone upload to at least one target failed |
 | 13 | Restore failed |
 | 14 | Restore test failed |
 
-On every error, a Telegram message is sent with the exit code and the affected component.
-
-***
+Every error triggers a Telegram message with exit code and affected component.
 
 ## Troubleshooting
 
-### `❌ /root/.borg_passphrase not found`
-The passphrase file is missing. Create it manually:
+### Passphrase file missing
+
+The file `/root/.borg_passphrase` is missing. Create it manually:
+
 ```bash
 echo "YOUR_PASSPHRASE" > /root/.borg_passphrase
 chmod 600 /root/.borg_passphrase
 ```
 
-### `⚠️ Backup already running (lock active)`
-Another backup process is still active. Check with:
+### Backup already running
+
+Another backup process is still active (`Backup already running (lock active)` in the log). Check with:
+
 ```bash
 ps aux | grep paperless-backup
-ls /var/lock/paperless-backup-*.lock
+ls /run/pabo/
 ```
 
 ### Borg repository unreachable
+
 ```bash
 export BORG_PASSCOMMAND="cat /root/.borg_passphrase"
 borg info /backup/paperless-borg
 ```
 
+### Upload aborted
+
+The guard against data loss has kicked in: the local repository had no `config`, no archives or no data segments. Find the cause:
+
+```bash
+ls -la /backup/paperless-borg
+export BORG_PASSCOMMAND="cat /root/.borg_passphrase"
+borg list /backup/paperless-borg
+```
+
+While the preflight fails, nothing is synced to the cloud.
+
 ### rclone remote missing
+
 ```bash
 rclone listremotes
-rclone config  # Reconfigure remote
+rclone config  # Set up the remote again
 sudo pabo.sh  # → 1) setup → 1) Change targets
 ```
 
 ### Telegram notifications not arriving
+
+Test token and chat ID by hand:
+
 ```bash
-# Test token and chat ID:
 curl -s "https://api.telegram.org/bot<TOKEN>/getMe"
 curl -s "https://api.telegram.org/bot<TOKEN>/sendMessage" \
   -d "chat_id=<CHAT_ID>&text=Test"
 ```
 
 ### Borg check fails
+
 ```bash
 export BORG_PASSCOMMAND="cat /root/.borg_passphrase"
 borg check --repair /backup/paperless-borg
@@ -402,17 +407,18 @@ borg check --repair /backup/paperless-borg
 ```
 
 ### `ERROR: cannot drop the currently open database`
-The `DROP DATABASE` command must not be run against the database being dropped.
-Connect via `postgres` instead:
+
+The `DROP` command must not run against the database being dropped. Connect via `postgres` instead:
+
 ```bash
 docker exec db psql -U paperless -d postgres -c "DROP DATABASE paperless;"
 docker exec db psql -U paperless -d postgres -c "CREATE DATABASE paperless OWNER paperless;"
 ```
 
 ### `WARNING: collation version mismatch`
-This warning appears when the PostgreSQL collation version of the container does not
-match the operating system. It is **harmless** and does not block backup or restore.
-Optionally fix with:
+
+This warning appears when the PostgreSQL collation version of the container does not match the operating system version. It blocks neither backup nor restore. Optionally fix with:
+
 ```bash
 docker exec db psql -U paperless -d postgres -c "ALTER DATABASE paperless REFRESH COLLATION VERSION;"
 docker exec db psql -U paperless -d postgres -c "ALTER DATABASE template1 REFRESH COLLATION VERSION;"
