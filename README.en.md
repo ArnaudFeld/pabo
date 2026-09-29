@@ -176,7 +176,15 @@ When PABO runs on several machines, every message ends up in the same chat. To k
 
 Without `INSTANCE_NAME`, PABO derives the label itself from hostname and IP address (`paperless-ngx (10.10.10.108)`). The IP is taken from the route of outbound traffic where possible, and loopback addresses are skipped. The same label appears once per run in the log.
 
-`INSTANCE_NAME` is free text up to 40 characters; quotes, backslash, `$`, and backtick are not allowed. Leaving it empty is explicitly fine and switches on the automatic fallback. Regenerate scripts and timers after changing it.
+`INSTANCE_NAME` is free text up to 40 characters; quotes, backslash, `$`, and backtick are not allowed. Leaving it empty is explicitly fine and switches on the automatic fallback.
+
+On an existing host you can change the name afterwards without running through the setup questions again:
+
+```bash
+sudo pabo.sh  # → 1) setup → 3) change only the Telegram label
+```
+
+Only that single line is touched; comments and manual edits in the config are preserved. A timestamped backup is created first, and if the config turns out to be invalid afterwards, PABO rolls it back. Empty input removes the name again, `b` aborts. For the log line it is enough to regenerate the scripts once (`setup` → 2).
 
 A rotated Telegram token goes into the config by hand; then regenerate scripts and timers:
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-# pabo.sh – PABO: Paperless-Borg Backup Orchestrator v1.2.0
+# pabo.sh – PABO: Paperless-Borg Backup Orchestrator v1.2.1
 # Automated, encrypted, multi-cloud backups for Paperless-ngx
 # powered by BorgBackup and rclone.
 # https://github.com/ArnaudFeld/pabo
@@ -19,7 +19,7 @@ umask 077
 # ═════════════════════════════════════════════
 # >>> PABO COMMON BEGIN
 
-PABO_VERSION="1.2.0"
+PABO_VERSION="1.2.1"
 
 CONF_FILE="/etc/paperless-backup.conf"
 PASSPHRASE_FILE="/root/.borg_passphrase"
@@ -1225,6 +1225,120 @@ cleanup_old_scripts() {
 # SETUP
 # ─────────────────────────────────────────────
 
+# Aendert ausschliesslich INSTANCE_NAME in der bestehenden Config.
+# Bewusst kein write_conf: der Rest der Datei bleibt unangetastet,
+# inklusive Kommentaren und Handaenderungen.
+set_instance_name() {
+  require_root
+
+  if [[ ! -f "$CONF_FILE" ]]; then
+    echo "❌ Keine Konfiguration gefunden unter ${CONF_FILE}"
+    echo "   Bitte zuerst 'setup' ausführen."
+    return 1
+  fi
+
+  echo "🏷️  Telegram-Bezeichnung ändern"
+  echo ""
+  echo "   Das ist die Kennung, die über jeder Telegram-Meldung steht."
+  echo "   Leer lassen schaltet auf den automatischen Fallback zurück"
+  echo "   (Hostname + IP-Adresse)."
+  echo ""
+  local current="" neu backup
+  current="$(awk -F= '/^INSTANCE_NAME=/{sub(/^INSTANCE_NAME="/,"",$0); sub(/"$/,"",$0); print; exit}' "$CONF_FILE")"
+  if [[ -n "$current" ]]; then
+    echo "   Aktuell: '${current}'"
+  else
+    echo "   Aktuell: keine (automatischer Name)"
+  fi
+  echo ""
+
+  while true; do
+    if ! read -rp "   Neue Bezeichnung (leer = entfernen, b = abbrechen): " neu; then
+      # EOF: keine weitere Eingabe. Nichts aendern, statt still zu loeschen.
+      echo ""
+      echo "Abgebrochen – Konfiguration unverändert."
+      return 0
+    fi
+    if [[ "$neu" == "b" || "$neu" == "B" ]]; then
+      echo ""
+      echo "Abgebrochen – Konfiguration unverändert."
+      return 0
+    fi
+    if valid_label "$neu"; then
+      break
+    fi
+    echo "   ❌ Unzulässige Zeichen (Quotes, Backslash, Dollarzeichen und Backtick) oder länger als 40 Zeichen"
+  done
+
+  backup="${CONF_FILE}.bak-$(date +%Y%m%d-%H%M%S)"
+  cp -p "$CONF_FILE" "$backup" || {
+    echo "❌ Sicherung fehlgeschlagen – Abbruch ohne Änderung"
+    return 1
+  }
+  chmod 600 "$backup"
+
+  # Datei zeilenweise neu schreiben: vorhandene Zeile ersetzen oder nach
+  # TELEGRAM_CHAT_ID einfuegen. Nichts anderes wird angefasst.
+  # Vorher entscheiden: existiert die Zeile schon? Sonst wuerde sie beim
+  # Einfuegen nach TELEGRAM_CHAT_ID zusaetzlich stehen bleiben.
+  local has_name=0
+  grep -q '^INSTANCE_NAME=' "$CONF_FILE" && has_name=1
+
+  local tmp
+  tmp="$(mktemp)" || { echo "❌ Kein Tempfile verfügbar"; return 1; }
+  local inserted=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ $has_name -eq 1 && "$line" == INSTANCE_NAME=* ]]; then
+      # Vorhandene Zeile ersetzen, aber nur einmal schreiben
+      if [[ $inserted -eq 0 ]]; then
+        printf 'INSTANCE_NAME="%s"\n' "$neu" >> "$tmp"
+        inserted=1
+      fi
+      continue
+    fi
+    printf '%s\n' "$line" >> "$tmp"
+    if [[ $has_name -eq 0 && $inserted -eq 0 && "$line" == TELEGRAM_CHAT_ID=* ]]; then
+      printf 'INSTANCE_NAME="%s"\n' "$neu" >> "$tmp"
+      inserted=1
+    fi
+  done < "$CONF_FILE"
+
+  if [[ $inserted -eq 0 ]]; then
+    # Weder TELEGRAM_CHAT_ID noch INSTANCE_NAME gefunden – hinten anhaengen
+    printf '\nINSTANCE_NAME="%s"\n' "$neu" >> "$tmp"
+  fi
+
+  if ! cmp -s "$tmp" "$CONF_FILE"; then
+    cat "$tmp" > "$CONF_FILE" || {
+      rm -f "$tmp"
+      echo "❌ Schreiben fehlgeschlagen – Abbruch ohne Änderung"
+      return 1
+    }
+    chmod 600 "$CONF_FILE"
+  fi
+  rm -f "$tmp"
+
+  # Pruefen, ob die neue Config noch gültig ist
+  if ! parse_conf "$CONF_FILE" >/dev/null 2>&1; then
+    echo ""
+    echo "❌ Die geänderte Konfiguration ist nicht mehr gültig – zurückgerollt"
+    cp -p "$backup" "$CONF_FILE"
+    return 1
+  fi
+
+  echo ""
+  if [[ -n "$neu" ]]; then
+    echo "✅ Telegram-Meldungen werden ab jetzt mit '${neu}' gekennzeichnet."
+  else
+    echo "✅ Bezeichnung entfernt – es wird wieder Hostname + IP verwendet."
+  fi
+  echo "   Gesichert als: ${backup}"
+  echo ""
+  echo "ℹ️  Die Meldungen zeigen den neuen Namen ab dem nächsten Backup."
+  echo "   Für das Log: setup → 2) Scripts und Timer neu generieren"
+  return 0
+}
+
 run_setup() {
   require_root
 
@@ -1238,13 +1352,15 @@ run_setup() {
     echo "Was möchtest du tun?"
     echo "  1) Ziele ändern (Config teilweise neu einrichten)"
     echo "  2) Scripts und Timer neu generieren (Config unverändert)"
-    echo "  3) Abbrechen"
+    echo "  3) Nur Bezeichnung für Telegram ändern"
+    echo "  4) Abbrechen"
     local mode_choice
-    prompt_int "Auswahl (1-3): " 1 3 mode_choice
+    prompt_int "Auswahl (1-4): " 1 4 mode_choice
     case "$mode_choice" in
       1) SETUP_MODE=1 ;;
       2) SETUP_MODE=2 ;;
-      3) echo "Abgebrochen."; exit 0 ;;
+      3) SETUP_MODE=3 ;;
+      4) echo "Abgebrochen."; exit 0 ;;
     esac
     load_conf
     echo ""
@@ -1260,6 +1376,11 @@ run_setup() {
   echo "╔══════════════════════════════════════╗"
   echo "║     Paperless Backup Setup           ║"
   echo "╚══════════════════════════════════════╝"
+
+  if [[ $SETUP_MODE -eq 3 ]]; then
+    set_instance_name
+    exit 0
+  fi
 
   if [[ $SETUP_MODE -eq 2 ]]; then
     cleanup_old_scripts

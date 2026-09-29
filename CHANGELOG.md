@@ -3,7 +3,7 @@
 All notable changes to PABO will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [1.2.0] – 2026-09-29
+## [1.2.1] – 2026-09-29
 
 ### Added
 - **Telegram-Meldungen sagen jetzt, von welchem Host sie kommen.** Läuft
@@ -23,6 +23,13 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   übersprungen. Für bestehende Configs ändert sich nichts, der Fallback
   greift ohne Eingriff. `INSTANCE_NAME` ist Freitext bis 40 Zeichen und
   lässt Quotes, Backslash, `$` und Backtick nicht zu.
+
+  Für Bestandshosts gibt es zusätzlich `setup` → 3) Nur Bezeichnung für
+  Telegram ändern. Das fasst ausschließlich diese eine Zeile an, Kommentare
+  und Handänderungen in der Config bleiben erhalten. Vorher entsteht eine
+  Sicherung mit Zeitstempel, und wird die Config nach der Änderung
+  ungültig, rollt PABO sie zurück. Leere Eingabe entfernt den Namen wieder,
+  `b` bricht ab.
 
 ## [1.1.1] – 2026-09-29
 

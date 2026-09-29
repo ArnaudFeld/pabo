@@ -176,7 +176,15 @@ Läuft PABO auf mehreren Maschinen, landen alle Meldungen im selben Chat. Damit 
 
 Ohne `INSTANCE_NAME` ermittelt PABO die Kennung selbst, nämlich Hostname und IP-Adresse (`paperless-ngx (10.10.10.108)`). Die IP wird bevorzugt aus der Route des ausgehenden Verkehrs gelesen, Loopback-Adressen werden übergangen. Dieselbe Kennung steht einmal pro Lauf im Log.
 
-`INSTANCE_NAME` ist Freitext bis 40 Zeichen; Quotes, Backslash, `$` und Backtick sind nicht erlaubt. Leer ist ausdrücklich erlaubt und schaltet den automatischen Fallback frei. Nach dem Ändern Scripts und Timer neu erzeugen.
+`INSTANCE_NAME` ist Freitext bis 40 Zeichen; Quotes, Backslash, `$` und Backtick sind nicht erlaubt. Leer ist ausdrücklich erlaubt und schaltet den automatischen Fallback frei.
+
+Auf einem Bestandshost lässt sich der Name nachträglich ändern, ohne die Setup-Fragen erneut zu durchlaufen:
+
+```bash
+sudo pabo.sh  # → 1) setup → 3) Nur Bezeichnung für Telegram ändern
+```
+
+Dabei wird ausschließlich die eine Zeile angefasst, Kommentare und Handänderungen in der Config bleiben erhalten. Vorher entsteht eine Sicherung mit Zeitstempel; wird die Config danach ungültig, rollt PABO sie zurück. Leeres Eingeben entfernt den Namen wieder, `b` bricht ab. Für die Log-Zeile genügt es, die Scripts einmal neu zu erzeugen (`setup` → 2).
 
 Ein rotiertes Telegram-Token gehört von Hand in die Config; danach Scripts und Timer neu erzeugen:
 
