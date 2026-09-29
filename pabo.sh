@@ -1,5 +1,5 @@
 #!/bin/bash
-# pabo.sh – PABO: Paperless-Borg Backup Orchestrator v1.1.0
+# pabo.sh – PABO: Paperless-Borg Backup Orchestrator v1.1.1
 # Automated, encrypted, multi-cloud backups for Paperless-ngx
 # powered by BorgBackup and rclone.
 # https://github.com/ArnaudFeld/pabo
@@ -19,7 +19,7 @@ umask 077
 # ═════════════════════════════════════════════
 # >>> PABO COMMON BEGIN
 
-PABO_VERSION="1.1.0"
+PABO_VERSION="1.1.1"
 
 CONF_FILE="/etc/paperless-backup.conf"
 PASSPHRASE_FILE="/root/.borg_passphrase"
