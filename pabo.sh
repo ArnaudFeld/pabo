@@ -1,5 +1,5 @@
 #!/bin/bash
-# pabo.sh – PABO: Paperless-Borg Backup Orchestrator v1.2.1
+# pabo.sh – PABO: Paperless-Borg Backup Orchestrator v1.3.0
 # Automated, encrypted, multi-cloud backups for Paperless-ngx
 # powered by BorgBackup and rclone.
 # https://github.com/ArnaudFeld/pabo
@@ -19,7 +19,7 @@ umask 077
 # ═════════════════════════════════════════════
 # >>> PABO COMMON BEGIN
 
-PABO_VERSION="1.2.1"
+PABO_VERSION="1.3.0"
 
 CONF_FILE="/etc/paperless-backup.conf"
 PASSPHRASE_FILE="/root/.borg_passphrase"
@@ -31,6 +31,8 @@ RESTORE_TEST_DIR="/backup/restore-test"
 MIN_BORG_VERSION="1.4.0"
 # Die generierten Scripts überschreiben LOG_FILE nach dem Sourcen.
 LOG_FILE="${LOG_FILE:-/var/log/paperless-backup.log}"
+# Zeitstempel des letzten erfolgreichen Backups, siehe check_backup_freshness
+LAST_SUCCESS_FILE="${LAST_SUCCESS_FILE:-/var/lib/paperless-backup/last_success}"
 
 EXIT_OK=0; EXIT_DB=10; EXIT_BORG=11; EXIT_RCLONE=12; EXIT_RESTORE=13; EXIT_RESTORE_TEST=14
 
@@ -229,7 +231,7 @@ _conf_scalar() {
         conf_error "TELEGRAM_CHAT_ID ist keine Ganzzahl: '${val}'"
       fi
       ;;
-    RCLONE_TRANSFERS|RCLONE_CHECKERS|RCLONE_MAX_DELETE|BACKUP_MIN_FREE_MB)
+    RCLONE_TRANSFERS|RCLONE_CHECKERS|RCLONE_MAX_DELETE|BACKUP_MIN_FREE_MB|STALE_BACKUP_DAYS)
       if valid_int "$val"; then
         printf -v "$key" '%s' "$val"
       else
@@ -311,6 +313,7 @@ parse_conf() {
   MEDIA_DIR=""; DATA_DIR=""; EXPORT_DIR=""; BORG_REPO=""; BACKUP_TMP=""
   TELEGRAM_TOKEN=""; TELEGRAM_CHAT_ID=""; INSTANCE_NAME=""
   RCLONE_BWLIMIT=""; RCLONE_TRANSFERS=""; RCLONE_CHECKERS=""; RCLONE_MAX_DELETE=""; BACKUP_MIN_FREE_MB=""
+  STALE_BACKUP_DAYS=""
   ENABLE_DOCUMENT_EXPORTER="false"; EXPORTER_DEST=""
   BACKUP_TARGETS=(); BORG_EXCLUDES=()
 
@@ -381,6 +384,11 @@ parse_conf() {
   BACKUP_MIN_FREE_MB="${BACKUP_MIN_FREE_MB:-4096}"
   if ! valid_int "$BACKUP_MIN_FREE_MB"; then
     conf_error "BACKUP_MIN_FREE_MB ist keine Ganzzahl: '${BACKUP_MIN_FREE_MB}'"
+  fi
+
+  STALE_BACKUP_DAYS="${STALE_BACKUP_DAYS:-2}"
+  if ! valid_int "$STALE_BACKUP_DAYS" || (( STALE_BACKUP_DAYS < 1 )); then
+    conf_error "STALE_BACKUP_DAYS muss eine Ganzzahl ab 1 sein: '${STALE_BACKUP_DAYS}'"
   fi
 
   if (( ${#BACKUP_TARGETS[@]} == 0 )); then
@@ -498,6 +506,7 @@ write_conf() {
     _conf_emit RCLONE_CHECKERS    "${RCLONE_CHECKERS}"
     _conf_emit RCLONE_MAX_DELETE  "${RCLONE_MAX_DELETE:-500}"
     _conf_emit BACKUP_MIN_FREE_MB "${BACKUP_MIN_FREE_MB:-4096}"
+    _conf_emit STALE_BACKUP_DAYS  "${STALE_BACKUP_DAYS:-2}"
     printf '\n'
 
     printf 'BORG_EXCLUDES=(\n'
@@ -670,6 +679,171 @@ fs_free_kb() {
     return 1
   fi
   printf '%s' "$free"
+  return 0
+}
+
+# Erkennt, ob zwei Pfade auf demselben Dateisystem liegen. df --output=source
+# vergleicht Device-Namen und meldet BIND-Mounts und LVM zusammen mit dem
+# Hostsystem als "anderes Device", obwohl der Speicher physikalisch derselbe
+# ist. findmnt loest den Mountpunkt auf und wird deshalb bevorzugt.
+same_filesystem() {
+  local a="$1" b="$2" sa sb
+  sa="$(fs_mount_source "$a")" || return 1
+  sb="$(fs_mount_source "$b")" || return 1
+  [[ -n "$sa" && -n "$sb" ]] || return 1
+  [[ "$sa" == "$sb" ]]
+}
+
+# Loest den Pfad zum gemounteten Dateisystem auf und faellt auf df zurueck.
+fs_mount_source() {
+  local path="$1" src=""
+  if command -v findmnt >/dev/null 2>&1; then
+    src="$(findmnt -n -o SOURCE --target "$path" 2>/dev/null || true)"
+    src="${src%%[*}"          # /dev/sda1[/var/lib/docker] -> /dev/sda1
+  fi
+  if [[ -z "$src" ]]; then
+    src="$(df --output=source "$path" 2>/dev/null | tail -1 || true)"
+  fi
+  src="${src//[[:space:]]/}"
+  [[ -n "$src" ]] || return 1
+  printf '%s' "$src"
+}
+
+# Prueft einen extrahierten PostgreSQL-Dump, ob er wirklich brauchbar ist.
+# Bisher reichte ein Header-Blick auf die ersten fuenf Zeilen - ein
+# abgeschnittener Dump mit intaktem Kopf waere so durchgegangen. Jetzt:
+# Mindestgroesse, vollstaendiger SQL-Inhalt, und wenn moeglich eine echte
+# Syntaxpruefung im laufenden DB-Container.
+validate_db_dump() {
+  local dump="$1" size_bytes="" tables=0 size_h=""
+  [[ -f "$dump" ]] || { printf 'Datei fehlt'; return 1; }
+
+  size_bytes=$(wc -c < "$dump" 2>/dev/null || echo 0)
+  size_bytes="${size_bytes//[[:space:]]/}"
+  if (( size_bytes < 100 )); then
+    printf 'Dump ist mit %s Byte zu klein für einen PostgreSQL-Dump' "$size_bytes"
+    return 1
+  fi
+
+  # SQL-Inhalt: ohne diese Befehle ist es kein brauchbarer Dump
+  tables=$(grep -c -E '^(CREATE|COPY) ' "$dump" 2>/dev/null || echo 0)
+  if (( tables < 2 )); then
+    printf 'Dump enthält zu wenige CREATE/COPY-Anweisungen (%s) - vermutlich abgebrochen' "$tables"
+    return 1
+  fi
+
+  # Ein echter pg_dump endet mit dem Kommentarblock "database dump complete".
+  # Fehlt er, wurde der Dump mitten im Schreiben abgeschnitten - genau der Fall,
+  # der bei einem reinen Blick auf die ersten Zeilen durchgerutscht waere.
+  if ! tail -40 "$dump" | grep -q 'database dump complete'; then
+    printf 'Abschlussmarker "database dump complete" fehlt - Dump vermutlich abgebrochen'
+    return 1
+  fi
+
+  # Echte Syntaxprüfung, wenn der DB-Container läuft
+  if container_running "${DB_CONTAINER}"; then
+    if docker exec -i "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" \
+         --quiet --set ON_ERROR_STOP=1 -f - >/dev/null 2>&1 < "${dump}"; then
+      size_h=$(du -sh "$dump" | cut -f1)
+      printf 'Syntax vollständig lesbar (%s, %s Anweisungen)' "$size_h" "$tables"
+      return 0
+    fi
+    # Der Dump kann einfuegen (CREATE DATABASE o.ae.) - das ist kein Fehler.
+    if docker exec -i "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" \
+         --quiet -f - >/dev/null 2>&1 < "${dump}"; then
+      size_h=$(du -sh "$dump" | cut -f1)
+      printf 'lesbar (%s, %s Anweisungen, mit nicht-transaktionalen Befehlen)' "$size_h" "$tables"
+      return 0
+    fi
+    printf 'SQL-Syntaxprüfung im Container fehlgeschlagen - Dump vermutlich nicht wiederherstellbar'
+    return 1
+  fi
+
+  size_h=$(du -sh "$dump" | cut -f1)
+  printf 'Struktur OK (%s, %s Anweisungen; Container aus, keine Syntaxprüfung)' "$size_h" "$tables"
+  return 0
+}
+
+# Logrotation fuer die drei PABO-Logs. Ohne das waechst das Backup-Log
+# unbegrenzt; nach einem Jahr ist ein tail am Telefon unbrauchbar.
+setup_logrotate_config() {
+  local conf="/etc/logrotate.d/paperless-backup"
+  if [[ -f "$conf" ]]; then
+    echo "ℹ️  logrotate-Regel vorhanden (${conf})"
+    return 0
+  fi
+  if ! command -v logrotate >/dev/null 2>&1; then
+    log "⚠️  logrotate ist nicht installiert – keine Rotation eingerichtet"
+    return 1
+  fi
+  cat > "$conf" <<'EOF'
+# Von PABO erzeugt - Logs von paperless-backup
+/var/log/paperless-backup.log
+/var/log/paperless-borg-check.log
+/var/log/paperless-restore-test.log
+{
+    weekly
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 600 root root
+}
+EOF
+  chmod 644 "$conf"
+  echo "   ✅ logrotate-Regel (${conf}): wöchentlich, 8 Generationen, komprimiert"
+  return 0
+}
+
+# Zeitpunkt des letzten erfolgreichen Backups festhalten.
+# Wird nur bei echtem Erfolg geschrieben, nicht bei dry-run.
+mark_backup_success() {
+  install -d -m 700 "$(dirname "${LAST_SUCCESS_FILE}")" 2>/dev/null || true
+  printf '%s\n' "$(date +%s)" > "${LAST_SUCCESS_FILE}" 2>/dev/null || {
+    log "⚠️  Zeitstempel für ${LAST_SUCCESS_FILE} nicht schreibbar"
+    return 1
+  }
+  chmod 600 "${LAST_SUCCESS_FILE}" 2>/dev/null || true
+  return 0
+}
+
+# Alter des letzten erfolgreichen Backups in Tagen (leer = unbekannt).
+backup_age_days() {
+  local ts=""
+  [[ -r "${LAST_SUCCESS_FILE}" ]] || { printf ''; return 1; }
+  ts="$(head -1 "${LAST_SUCCESS_FILE}" 2>/dev/null || true)"
+  [[ "$ts" =~ ^[0-9]+$ ]] || { printf ''; return 1; }
+  local now age
+  now=$(date +%s)
+  (( now >= ts )) || { printf '0'; return 0; }
+  age=$(( (now - ts) / 86400 ))
+  printf '%s' "$age"
+  return 0
+}
+
+# Stiller Ausfall: der Backup-Timer laeuft nicht mehr, und ohne diesen
+# Check faellt es niemandem auf, weil Erfolg und Stillschweigen identisch
+# aussehen. Wird aus jedem regulaeren Lauf aufgerufen, nicht nur beim
+# Backup - ein toter Timer erreicht den Aufruf sonst nie.
+check_backup_freshness() {
+  local max_days="${STALE_BACKUP_DAYS:-2}"
+  local age
+  if ! age=$(backup_age_days); then
+    log "⚠️  Noch kein erfolgreiches Backup protokolliert (${LAST_SUCCESS_FILE} fehlt oder unlesbar)"
+    return 0
+  fi
+  if (( age >= max_days )); then
+    log "❌ Letztes erfolgreiches Backup ist ${age} Tage alt (Schwelle: ${max_days} Tage)"
+    send_telegram "❌ Kein erfolgreiches Backup seit ${age} Tagen
+📅 Letztes Backup vor ${age} Tagen
+⏳ Erwartet: mindestens alle ${max_days} Tage
+🔎 Grund: prüfe den Backup-Timer (systemctl list-timers | grep paperless)
+💡 In /etc/paperless-backup.conf anpassbar: STALE_BACKUP_DAYS
+📋 Log: cat ${LOG_FILE}"
+    return 1
+  fi
+  log "ℹ️  Letztes Backup vor ${age} Tag(en) – innerhalb der Schwelle (${max_days} Tage)"
   return 0
 }
 
@@ -940,6 +1114,8 @@ run_backup() {
       exit "$EXIT_OK"
     fi
 
+    mark_backup_success
+
     send_telegram "✅ Paperless Backup erfolgreich
 🗄 Archiv: ${ARCHIVE_NAME_CREATED}
 ☁️ Ziele: ${#BACKUP_TARGETS[@]}
@@ -1064,6 +1240,7 @@ run_restore_test() {
       borg extract "${BORG_REPO}::${archive}" 2>&1 | tee -a "$LOG_FILE"
     ) || errors+=("Borg-Extraktion fehlgeschlagen")
 
+    local db_detail=""
     local extracted_media="${test_dir}/${MEDIA_DIR#/}"
     local extracted_data="${test_dir}/${DATA_DIR#/}"
     local extracted_compose="${test_dir}/${COMPOSE_FILE#/}"
@@ -1090,10 +1267,11 @@ run_restore_test() {
     fi
 
     if [[ -f "$extracted_db" ]]; then
-      if head -5 "$extracted_db" | grep -q "PostgreSQL\|pg_dump"; then
-        log "✅ PostgreSQL-Dump OK ($(du -sh "$extracted_db" | cut -f1))"
+      if db_detail=$(validate_db_dump "$extracted_db"); then
+        log "✅ PostgreSQL-Dump OK (${db_detail})"
       else
-        errors+=("PostgreSQL-Dump Header ungültig"); log "❌ DB-Dump Header ungültig!"
+        errors+=("PostgreSQL-Dump unbrauchbar: ${db_detail}")
+        log "❌ DB-Dump unbrauchbar: ${db_detail}"
       fi
     else
       errors+=("PostgreSQL-Dump fehlt (${extracted_db})"); log "❌ DB-Dump fehlt!"
@@ -1339,387 +1517,344 @@ set_instance_name() {
   return 0
 }
 
-run_setup() {
-  require_root
 
-  local SETUP_MODE=0
-  _SETUP_VARS_LOADED=1
+# ─────────────────────────────────────────────
+# SETUP
+# ─────────────────────────────────────────────
 
-  if [[ -f "$CONF_FILE" ]]; then
-    echo ""
-    echo "⚠️  Bestehende Konfiguration gefunden: ${CONF_FILE}"
-    echo ""
-    echo "Was möchtest du tun?"
-    echo "  1) Ziele ändern (Config teilweise neu einrichten)"
-    echo "  2) Scripts und Timer neu generieren (Config unverändert)"
-    echo "  3) Nur Bezeichnung für Telegram ändern"
-    echo "  4) Abbrechen"
-    local mode_choice
-    prompt_int "Auswahl (1-4): " 1 4 mode_choice
-    case "$mode_choice" in
-      1) SETUP_MODE=1 ;;
-      2) SETUP_MODE=2 ;;
-      3) SETUP_MODE=3 ;;
-      4) echo "Abgebrochen."; exit 0 ;;
-    esac
-    load_conf
-    echo ""
-    echo "   Aktuell konfigurierte Ziele:"
-    local t
-    for t in "${BACKUP_TARGETS[@]}"; do
-      echo "   • ${t}"
-    done
-    echo ""
-    echo "🔒 Borg-Repository und Passphrase werden nicht verändert."
-  fi
+# Die Fragen des frischen Setups liegen in eigenen Funktionen, damit
+# run_setup() den Ablauf zeigt statt 400 Zeilen Frageblöcke zu verbergen.
+setup_ask_dependencies() {
+echo ""
+echo "📦 Installiere Abhängigkeiten..."
+apt-get update -qq
+apt-get install -y -qq borgbackup curl rclone postgresql-client jq
+}
 
-  echo "╔══════════════════════════════════════╗"
-  echo "║     Paperless Backup Setup           ║"
-  echo "╚══════════════════════════════════════╝"
+setup_ask_targets() {
+echo ""
+echo "☁️  Prüfe rclone Remotes..."
+AVAILABLE_REMOTES=$(rclone listremotes 2>/dev/null || true)
 
-  if [[ $SETUP_MODE -eq 3 ]]; then
-    set_instance_name
-    exit 0
-  fi
-
-  if [[ $SETUP_MODE -eq 2 ]]; then
-    cleanup_old_scripts
-    generate_scripts
-    setup_systemd
-    echo ""
-    echo "✅ Scripts und Timer erfolgreich neu generiert."
-    return
-  fi
-
+if [[ -z "$AVAILABLE_REMOTES" ]]; then
   echo ""
-  echo "📦 Installiere Abhängigkeiten..."
-  apt-get update -qq
-  apt-get install -y -qq borgbackup curl rclone postgresql-client jq
-
-  echo ""
-  echo "☁️  Prüfe rclone Remotes..."
-  AVAILABLE_REMOTES=$(rclone listremotes 2>/dev/null || true)
-
-  if [[ -z "$AVAILABLE_REMOTES" ]]; then
-    echo ""
-    echo "⚠️  Keine rclone Remotes gefunden!"
-    read -rp "   Jetzt 'rclone config' starten? (j/n): " do_rclone
-    if [[ "$do_rclone" == "j" ]]; then
-      rclone config
-      AVAILABLE_REMOTES=$(rclone listremotes 2>/dev/null || true)
-      if [[ -z "$AVAILABLE_REMOTES" ]]; then
-        echo "❌ Weiterhin keine Remotes gefunden. Setup abgebrochen."
-        exit 1
-      fi
-    else
-      echo "❌ Kein Remote konfiguriert. Setup abgebrochen."
+  echo "⚠️  Keine rclone Remotes gefunden!"
+  read -rp "   Jetzt 'rclone config' starten? (j/n): " do_rclone
+  if [[ "$do_rclone" == "j" ]]; then
+    rclone config
+    AVAILABLE_REMOTES=$(rclone listremotes 2>/dev/null || true)
+    if [[ -z "$AVAILABLE_REMOTES" ]]; then
+      echo "❌ Weiterhin keine Remotes gefunden. Setup abgebrochen."
       exit 1
     fi
+  else
+    echo "❌ Kein Remote konfiguriert. Setup abgebrochen."
+    exit 1
   fi
+fi
 
+echo ""
+echo "Gefundene Remotes:"
+mapfile -t REMOTE_LIST <<< "$AVAILABLE_REMOTES"
+local i
+for i in "${!REMOTE_LIST[@]}"; do
+  echo "  $((i+1))) ${REMOTE_LIST[$i]}"
+done
+
+local TARGET_COUNT
+prompt_int "Wie viele Cloud-Ziele möchtest du nutzen? (1-${#REMOTE_LIST[@]}): " \
+  1 "${#REMOTE_LIST[@]}" TARGET_COUNT
+
+BACKUP_TARGETS=()
+local remote_idx SELECTED_REMOTE REMOTE_CLEAN remote_path
+for ((t=1; t<=TARGET_COUNT; t++)); do
   echo ""
-  echo "Gefundene Remotes:"
-  mapfile -t REMOTE_LIST <<< "$AVAILABLE_REMOTES"
-  local i
+  echo "── Ziel ${t} ──────────────────────────────"
   for i in "${!REMOTE_LIST[@]}"; do
     echo "  $((i+1))) ${REMOTE_LIST[$i]}"
   done
-
-  local TARGET_COUNT
-  prompt_int "Wie viele Cloud-Ziele möchtest du nutzen? (1-${#REMOTE_LIST[@]}): " \
-    1 "${#REMOTE_LIST[@]}" TARGET_COUNT
-
-  BACKUP_TARGETS=()
-  local remote_idx SELECTED_REMOTE REMOTE_CLEAN remote_path
-  for ((t=1; t<=TARGET_COUNT; t++)); do
-    echo ""
-    echo "── Ziel ${t} ──────────────────────────────"
-    for i in "${!REMOTE_LIST[@]}"; do
-      echo "  $((i+1))) ${REMOTE_LIST[$i]}"
-    done
-    prompt_int "Remote auswählen (1-${#REMOTE_LIST[@]}): " \
-      1 "${#REMOTE_LIST[@]}" remote_idx
-    SELECTED_REMOTE="${REMOTE_LIST[$((remote_idx-1))]}"
-    REMOTE_CLEAN="${SELECTED_REMOTE%:}"
-    local remote_path
-    while true; do
-      read -rp "Ziel-Pfad auf ${SELECTED_REMOTE} (z.B. /Paperless-Borg-Encrypted): " remote_path
-      if [[ -n "$remote_path" ]] && _conf_embeddable "$remote_path" \
-         && valid_target "${REMOTE_CLEAN}:${remote_path}"; then
-        break
-      fi
-      echo "   ❌ Bitte einen Pfad ohne Sonderzeichen angeben (z.B. /Paperless-Borg-Encrypted)"
-    done
-    BACKUP_TARGETS+=("${REMOTE_CLEAN}:${remote_path}")
-    echo "   ✅ Ziel ${t}: ${REMOTE_CLEAN}:${remote_path}"
-  done
-
-  if [[ $SETUP_MODE -eq 1 ]]; then
-    echo ""
-    echo "💾 Aktualisiere ${CONF_FILE}..."
-    _check_collected_values
-    write_conf
-    echo "   ✅ Konfiguration gespeichert (chmod 600)"
-    cleanup_old_scripts
-    generate_scripts
-    setup_systemd
-    echo ""
-    echo "✅ Ziele erfolgreich geändert."
-    send_telegram "✅ Paperless Backup – Ziele geändert
-📦 Neue Ziele: $(IFS=', '; echo "${BACKUP_TARGETS[*]}")
-🖥 Host: $(hostname)
-📅 $(date '+%Y-%m-%d %H:%M')"
-    return
-  fi
-
-  echo ""
-  echo "🐳 Erkenne Docker-Container..."
-  DETECTED_PAPERLESS=$(docker ps --format '{{.Names}}' | grep -i paperless | grep -v db | grep -v redis | head -1 || true)
-  DETECTED_DB=$(docker ps --format '{{.Names}}' | grep -iE "paperless.*(db|postgres)|postgres" | head -1 || true)
-
-  detect_value "Paperless Container" "${DETECTED_PAPERLESS:-paperless-webserver}" PAPERLESS_CONTAINER
-  detect_value "PostgreSQL Container" "${DETECTED_DB:-paperless-db}" DB_CONTAINER
-
-  DETECTED_COMPOSE=$(docker inspect "$PAPERLESS_CONTAINER" \
-    --format '{{index .Config.Labels "com.docker.compose.project.config_files"}}' 2>/dev/null || true)
-  [[ -z "$DETECTED_COMPOSE" ]] && DETECTED_COMPOSE="/home/paperless/docker-compose.yml"
-  detect_value "docker-compose.yml Pfad" "$DETECTED_COMPOSE" COMPOSE_FILE
-
-  DETECTED_DB_NAME=$(grep -E 'POSTGRES_DB|DB_NAME' "$COMPOSE_FILE" 2>/dev/null \
-    | grep -oP '(?<==)[^\s"]+' | head -1) || DETECTED_DB_NAME=""
-  DETECTED_DB_USER=$(grep -E 'POSTGRES_USER|DB_USER' "$COMPOSE_FILE" 2>/dev/null \
-    | grep -oP '(?<==)[^\s"]+' | head -1) || DETECTED_DB_USER=""
-  if [[ -z "$DETECTED_DB_NAME" ]]; then
-    echo "   ℹ️  Kein POSTGRES_DB gefunden – Standard wird vorgeschlagen"
-    DETECTED_DB_NAME="paperless"
-  fi
-  if [[ -z "$DETECTED_DB_USER" ]]; then
-    echo "   ℹ️  Kein POSTGRES_USER gefunden – Standard wird vorgeschlagen"
-    DETECTED_DB_USER="paperless"
-  fi
-  detect_value "Datenbank Name" "$DETECTED_DB_NAME" DB_NAME
-  detect_value "Datenbank User" "$DETECTED_DB_USER" DB_USER
-
-  echo ""
-  echo "📂 Erkenne gemountete Pfade..."
-  # docker inspect meldet Exit 0 mit leerer Ausgabe, wenn der Mount fehlt –
-  # deshalb hier auf Leer prüfen statt auf Exit-Code.
-  DETECTED_MEDIA=$(docker inspect "$PAPERLESS_CONTAINER" \
-    --format '{{range .Mounts}}{{if eq .Destination "/usr/src/paperless/media"}}{{.Source}}{{end}}{{end}}' \
-    2>/dev/null) || DETECTED_MEDIA=""
-  DETECTED_DATA=$(docker inspect "$PAPERLESS_CONTAINER" \
-    --format '{{range .Mounts}}{{if eq .Destination "/usr/src/paperless/data"}}{{.Source}}{{end}}{{end}}' \
-    2>/dev/null) || DETECTED_DATA=""
-  DETECTED_EXPORT=$(docker inspect "$PAPERLESS_CONTAINER" \
-    --format '{{range .Mounts}}{{if eq .Destination "/usr/src/paperless/export"}}{{.Source}}{{end}}{{end}}' \
-    2>/dev/null) || DETECTED_EXPORT=""
-
-  if [[ -z "$DETECTED_MEDIA" ]]; then
-    echo "   ⚠️  Kein Mount für /usr/src/paperless/media gefunden – Standard wird vorgeschlagen"
-    DETECTED_MEDIA="/data/paperless/media"
-  fi
-  if [[ -z "$DETECTED_DATA" ]]; then
-    echo "   ⚠️  Kein Mount für /usr/src/paperless/data gefunden – Standard wird vorgeschlagen"
-    DETECTED_DATA="/data/paperless/data"
-  fi
-  if [[ -z "$DETECTED_EXPORT" ]]; then
-    echo "   ℹ️  Kein Mount für /usr/src/paperless/export gefunden – Standard wird vorgeschlagen"
-    DETECTED_EXPORT="/data/paperless/export"
-  fi
-
-  detect_value "Media-Pfad"   "$DETECTED_MEDIA"  MEDIA_DIR
-  detect_value "Data-Pfad"    "$DETECTED_DATA"   DATA_DIR
-  detect_value "Export-Pfad"  "$DETECTED_EXPORT" EXPORT_DIR
-  detect_value "Borg Repository Pfad" "/backup/paperless-borg" BORG_REPO
-  detect_value "Temporäres Backup-Verzeichnis" "/backup/paperless-tmp" BACKUP_TMP
-
-  MEDIA_FS=$(df --output=source "$MEDIA_DIR" 2>/dev/null | tail -1 || echo "")
-  BORG_PARENT=$(dirname "$BORG_REPO")
-  mkdir -p "$BORG_PARENT"
-  BORG_FS=$(df --output=source "$BORG_PARENT" 2>/dev/null | tail -1 || echo "")
-  if [[ -n "$MEDIA_FS" && -n "$BORG_FS" && "$MEDIA_FS" == "$BORG_FS" ]]; then
-    echo ""
-    echo "┌──────────────────────────────────────────────────┐"
-    echo "│  ⚠️  WARNUNG: BORG_REPO liegt auf demselben       │"
-    echo "│  Filesystem wie deine Paperless-Daten!           │"
-    echo "│  • Kein Schutz bei Disk-Full                     │"
-    echo "│  • Kein Schutz bei Disk-Failure                  │"
-    echo "│  Empfehlung: BORG_REPO auf separates Laufwerk    │"
-    echo "└──────────────────────────────────────────────────┘"
-    read -rp "   Trotzdem fortfahren? (j/n): " fs_warn_ok
-    [[ "$fs_warn_ok" != "j" ]] && { echo "Setup abgebrochen."; exit 0; }
-  fi
-
-  echo ""
-  echo "📱 Telegram-Konfiguration"
+  prompt_int "Remote auswählen (1-${#REMOTE_LIST[@]}): " \
+    1 "${#REMOTE_LIST[@]}" remote_idx
+  SELECTED_REMOTE="${REMOTE_LIST[$((remote_idx-1))]}"
+  REMOTE_CLEAN="${SELECTED_REMOTE%:}"
+  local remote_path
   while true; do
-    read -rsp "   Bot Token: " TELEGRAM_TOKEN
-    echo ""
-    if valid_token "$TELEGRAM_TOKEN"; then
+    read -rp "Ziel-Pfad auf ${SELECTED_REMOTE} (z.B. /Paperless-Borg-Encrypted): " remote_path
+    if [[ -n "$remote_path" ]] && _conf_embeddable "$remote_path" \
+       && valid_target "${REMOTE_CLEAN}:${remote_path}"; then
       break
     fi
-    echo "   ❌ Format ungültig – erwartet wird '<id>:<token>' (z.B. 123456789:AA...)"
+    echo "   ❌ Bitte einen Pfad ohne Sonderzeichen angeben (z.B. /Paperless-Borg-Encrypted)"
   done
-  while true; do
-    read -rp "   Chat ID:   " TELEGRAM_CHAT_ID
-    if valid_chatid "$TELEGRAM_CHAT_ID"; then
-      break
-    fi
-    echo "   ❌ Ungültig – bitte eine Ganzzahl eingeben"
-  done
-  read -rp "   Bezeichnung für Telegram-Meldungen (leer = Hostname + IP): " INSTANCE_NAME
-  if ! valid_label "$INSTANCE_NAME"; then
-    echo "   ❌ Unzulässige Zeichen in der Bezeichnung – es wird der automatische Name verwendet"
-    INSTANCE_NAME=""
-  elif [[ -n "$INSTANCE_NAME" ]]; then
-    echo "   ℹ️  Meldungen werden mit '${INSTANCE_NAME}' gekennzeichnet"
+  BACKUP_TARGETS+=("${REMOTE_CLEAN}:${remote_path}")
+  echo "   ✅ Ziel ${t}: ${REMOTE_CLEAN}:${remote_path}"
+done
+}
+
+setup_ask_paths() {
+echo ""
+echo "🐳 Erkenne Docker-Container..."
+DETECTED_PAPERLESS=$(docker ps --format '{{.Names}}' | grep -i paperless | grep -v db | grep -v redis | head -1 || true)
+DETECTED_DB=$(docker ps --format '{{.Names}}' | grep -iE "paperless.*(db|postgres)|postgres" | head -1 || true)
+
+detect_value "Paperless Container" "${DETECTED_PAPERLESS:-paperless-webserver}" PAPERLESS_CONTAINER
+detect_value "PostgreSQL Container" "${DETECTED_DB:-paperless-db}" DB_CONTAINER
+
+DETECTED_COMPOSE=$(docker inspect "$PAPERLESS_CONTAINER" \
+  --format '{{index .Config.Labels "com.docker.compose.project.config_files"}}' 2>/dev/null || true)
+[[ -z "$DETECTED_COMPOSE" ]] && DETECTED_COMPOSE="/home/paperless/docker-compose.yml"
+detect_value "docker-compose.yml Pfad" "$DETECTED_COMPOSE" COMPOSE_FILE
+
+DETECTED_DB_NAME=$(grep -E 'POSTGRES_DB|DB_NAME' "$COMPOSE_FILE" 2>/dev/null \
+  | grep -oP '(?<==)[^\s"]+' | head -1) || DETECTED_DB_NAME=""
+DETECTED_DB_USER=$(grep -E 'POSTGRES_USER|DB_USER' "$COMPOSE_FILE" 2>/dev/null \
+  | grep -oP '(?<==)[^\s"]+' | head -1) || DETECTED_DB_USER=""
+if [[ -z "$DETECTED_DB_NAME" ]]; then
+  echo "   ℹ️  Kein POSTGRES_DB gefunden – Standard wird vorgeschlagen"
+  DETECTED_DB_NAME="paperless"
+fi
+if [[ -z "$DETECTED_DB_USER" ]]; then
+  echo "   ℹ️  Kein POSTGRES_USER gefunden – Standard wird vorgeschlagen"
+  DETECTED_DB_USER="paperless"
+fi
+detect_value "Datenbank Name" "$DETECTED_DB_NAME" DB_NAME
+detect_value "Datenbank User" "$DETECTED_DB_USER" DB_USER
+
+echo ""
+echo "📂 Erkenne gemountete Pfade..."
+# docker inspect meldet Exit 0 mit leerer Ausgabe, wenn der Mount fehlt –
+# deshalb hier auf Leer prüfen statt auf Exit-Code.
+DETECTED_MEDIA=$(docker inspect "$PAPERLESS_CONTAINER" \
+  --format '{{range .Mounts}}{{if eq .Destination "/usr/src/paperless/media"}}{{.Source}}{{end}}{{end}}' \
+  2>/dev/null) || DETECTED_MEDIA=""
+DETECTED_DATA=$(docker inspect "$PAPERLESS_CONTAINER" \
+  --format '{{range .Mounts}}{{if eq .Destination "/usr/src/paperless/data"}}{{.Source}}{{end}}{{end}}' \
+  2>/dev/null) || DETECTED_DATA=""
+DETECTED_EXPORT=$(docker inspect "$PAPERLESS_CONTAINER" \
+  --format '{{range .Mounts}}{{if eq .Destination "/usr/src/paperless/export"}}{{.Source}}{{end}}{{end}}' \
+  2>/dev/null) || DETECTED_EXPORT=""
+
+if [[ -z "$DETECTED_MEDIA" ]]; then
+  echo "   ⚠️  Kein Mount für /usr/src/paperless/media gefunden – Standard wird vorgeschlagen"
+  DETECTED_MEDIA="/data/paperless/media"
+fi
+if [[ -z "$DETECTED_DATA" ]]; then
+  echo "   ⚠️  Kein Mount für /usr/src/paperless/data gefunden – Standard wird vorgeschlagen"
+  DETECTED_DATA="/data/paperless/data"
+fi
+if [[ -z "$DETECTED_EXPORT" ]]; then
+  echo "   ℹ️  Kein Mount für /usr/src/paperless/export gefunden – Standard wird vorgeschlagen"
+  DETECTED_EXPORT="/data/paperless/export"
+fi
+
+detect_value "Media-Pfad"   "$DETECTED_MEDIA"  MEDIA_DIR
+detect_value "Data-Pfad"    "$DETECTED_DATA"   DATA_DIR
+detect_value "Export-Pfad"  "$DETECTED_EXPORT" EXPORT_DIR
+detect_value "Borg Repository Pfad" "/backup/paperless-borg" BORG_REPO
+detect_value "Temporäres Backup-Verzeichnis" "/backup/paperless-tmp" BACKUP_TMP
+
+BORG_PARENT=$(dirname "$BORG_REPO")
+mkdir -p "$BORG_PARENT"
+MEDIA_FS=$(fs_mount_source "$MEDIA_DIR" || echo "")
+BORG_FS=$(fs_mount_source "$BORG_PARENT" || echo "")
+if [[ -n "$MEDIA_FS" && -n "$BORG_FS" && "$MEDIA_FS" == "$BORG_FS" ]]; then
+  echo ""
+  echo "┌──────────────────────────────────────────────────┐"
+  echo "│  ⚠️  WARNUNG: BORG_REPO liegt auf demselben       │"
+  echo "│  Filesystem wie deine Paperless-Daten!           │"
+  echo "│  • Kein Schutz bei Disk-Full                     │"
+  echo "│  • Kein Schutz bei Disk-Failure                  │"
+  echo "│  Empfehlung: BORG_REPO auf separates Laufwerk    │"
+  echo "└──────────────────────────────────────────────────┘"
+  read -rp "   Trotzdem fortfahren? (j/n): " fs_warn_ok
+  [[ "$fs_warn_ok" != "j" ]] && { echo "Setup abgebrochen."; exit 0; }
+fi
+}
+
+setup_ask_telegram() {
+echo ""
+echo "📱 Telegram-Konfiguration"
+while true; do
+  read -rsp "   Bot Token: " TELEGRAM_TOKEN
+  echo ""
+  if valid_token "$TELEGRAM_TOKEN"; then
+    break
+  fi
+  echo "   ❌ Format ungültig – erwartet wird '<id>:<token>' (z.B. 123456789:AA...)"
+done
+while true; do
+  read -rp "   Chat ID:   " TELEGRAM_CHAT_ID
+  if valid_chatid "$TELEGRAM_CHAT_ID"; then
+    break
+  fi
+  echo "   ❌ Ungültig – bitte eine Ganzzahl eingeben"
+done
+read -rp "   Bezeichnung für Telegram-Meldungen (leer = Hostname + IP): " INSTANCE_NAME
+if ! valid_label "$INSTANCE_NAME"; then
+  echo "   ❌ Unzulässige Zeichen in der Bezeichnung – es wird der automatische Name verwendet"
+  INSTANCE_NAME=""
+elif [[ -n "$INSTANCE_NAME" ]]; then
+  echo "   ℹ️  Meldungen werden mit '${INSTANCE_NAME}' gekennzeichnet"
+else
+  INSTANCE_NAME=""
+  echo "   ℹ️  Es wird automatisch Hostname + IP verwendet"
+fi
+}
+
+setup_ask_rclone_options() {
+echo ""
+echo "☁️  rclone Upload-Optionen"
+while true; do
+  read -rp "   Bandbreitenlimit (leer = kein Limit, z.B. 2M): " RCLONE_BWLIMIT
+  if valid_bwlimit "$RCLONE_BWLIMIT"; then
+    break
+  fi
+  echo "   ❌ Ungültiges Format (z.B. 2M, 500K oder leer)"
+done
+while true; do
+  read -rp "   Parallele Transfers [4]: " RCLONE_TRANSFERS
+  RCLONE_TRANSFERS="${RCLONE_TRANSFERS:-4}"
+  if valid_int "$RCLONE_TRANSFERS"; then
+    break
+  fi
+  echo "   ❌ Bitte eine Ganzzahl eingeben"
+done
+while true; do
+  read -rp "   Checker [8]: " RCLONE_CHECKERS
+  RCLONE_CHECKERS="${RCLONE_CHECKERS:-8}"
+  if valid_int "$RCLONE_CHECKERS"; then
+    break
+  fi
+  echo "   ❌ Bitte eine Ganzzahl eingeben"
+done
+while true; do
+  read -rp "   Max. Löschungen pro Sync [500]: " RCLONE_MAX_DELETE
+  RCLONE_MAX_DELETE="${RCLONE_MAX_DELETE:-500}"
+  if valid_int "$RCLONE_MAX_DELETE"; then
+    break
+  fi
+  echo "   ❌ Bitte eine Ganzzahl eingeben (0 = unbegrenzt)"
+done
+while true; do
+  read -rp "   Mindestfreiraum vor Backup in MB [4096]: " BACKUP_MIN_FREE_MB
+  BACKUP_MIN_FREE_MB="${BACKUP_MIN_FREE_MB:-4096}"
+  if valid_int "$BACKUP_MIN_FREE_MB"; then
+    break
+  fi
+  echo "   ❌ Bitte eine Ganzzahl eingeben"
+done
+while true; do
+  read -rp "   Nach wie vielen Tagen ohne Backup warnen? [2]: " STALE_BACKUP_DAYS
+  STALE_BACKUP_DAYS="${STALE_BACKUP_DAYS:-2}"
+  if valid_int "$STALE_BACKUP_DAYS" && (( STALE_BACKUP_DAYS >= 1 )); then
+    break
+  fi
+  echo "   ❌ Bitte eine Ganzzahl ab 1 eingeben"
+done
+
+while true; do
+  read -rp "   Log-Rotation einrichten? (j/n) [j]: " setup_logrotate
+  [[ "${setup_logrotate:-j}" == "j" ]] && break
+  [[ "${setup_logrotate:-j}" == "n" ]] && break
+  echo "   ❌ Bitte j oder n eingeben"
+done
+}
+
+setup_ask_excludes() {
+echo ""
+echo "📂 Borg Exclude-Liste konfigurieren"
+BORG_EXCLUDES=()
+
+read -rp "   Log-Verzeichnis (${DATA_DIR}/log) ausschließen? (j/n) [j]: " excl_log
+[[ "${excl_log:-j}" == "j" ]] && BORG_EXCLUDES+=("${DATA_DIR}/log")
+BORG_EXCLUDES+=("${DATA_DIR}/celerybeat-schedule.db")
+
+if [[ -d "${DATA_DIR}/nltk" ]]; then
+  read -rp "   NLTK-Daten (${DATA_DIR}/nltk) ausschließen? (j/n) [j]: " excl_nltk
+  [[ "${excl_nltk:-j}" == "j" ]] && BORG_EXCLUDES+=("${DATA_DIR}/nltk")
+fi
+
+read -rp "   Export-Verzeichnis (${EXPORT_DIR}) ausschließen? (j/n) [n]: " excl_export
+[[ "${excl_export:-n}" == "j" ]] && BORG_EXCLUDES+=("${EXPORT_DIR}")
+
+BORG_EXCLUDES+=("*.tmp" "*.swp" "*.lock")
+
+read -rp "   Weitere Pfade/Muster hinzufügen? (j/n): " add_more
+while [[ "$add_more" == "j" ]]; do
+  read -rp "   Pfad oder Muster: " custom_excl
+  if valid_exclude "$custom_excl"; then
+    BORG_EXCLUDES+=("$custom_excl")
   else
-    INSTANCE_NAME=""
-    echo "   ℹ️  Es wird automatisch Hostname + IP verwendet"
+    echo "   ❌ Ungültiges Muster – wird übersprungen"
   fi
+  read -rp "   Noch einen? (j/n): " add_more
+done
 
-  echo ""
-  echo "☁️  rclone Upload-Optionen"
+echo ""
+echo "📄 Document-Exporter"
+read -rp "   Aktivieren? (j/n) [n]: " enable_exporter
+ENABLE_DOCUMENT_EXPORTER="false"
+EXPORTER_DEST="/usr/src/paperless/export"
+if [[ "${enable_exporter:-n}" == "j" ]]; then
+  ENABLE_DOCUMENT_EXPORTER="true"
   while true; do
-    read -rp "   Bandbreitenlimit (leer = kein Limit, z.B. 2M): " RCLONE_BWLIMIT
-    if valid_bwlimit "$RCLONE_BWLIMIT"; then
+    detect_value "Export-Zielverzeichnis im Container" "/usr/src/paperless/export" EXPORTER_DEST
+    if valid_path "$EXPORTER_DEST"; then
       break
     fi
-    echo "   ❌ Ungültiges Format (z.B. 2M, 500K oder leer)"
+    echo "   ❌ Bitte einen absoluten Pfad ohne Leerzeichen angeben"
   done
-  while true; do
-    read -rp "   Parallele Transfers [4]: " RCLONE_TRANSFERS
-    RCLONE_TRANSFERS="${RCLONE_TRANSFERS:-4}"
-    if valid_int "$RCLONE_TRANSFERS"; then
-      break
-    fi
-    echo "   ❌ Bitte eine Ganzzahl eingeben"
-  done
-  while true; do
-    read -rp "   Checker [8]: " RCLONE_CHECKERS
-    RCLONE_CHECKERS="${RCLONE_CHECKERS:-8}"
-    if valid_int "$RCLONE_CHECKERS"; then
-      break
-    fi
-    echo "   ❌ Bitte eine Ganzzahl eingeben"
-  done
-  while true; do
-    read -rp "   Max. Löschungen pro Sync [500]: " RCLONE_MAX_DELETE
-    RCLONE_MAX_DELETE="${RCLONE_MAX_DELETE:-500}"
-    if valid_int "$RCLONE_MAX_DELETE"; then
-      break
-    fi
-    echo "   ❌ Bitte eine Ganzzahl eingeben (0 = unbegrenzt)"
-  done
-  while true; do
-    read -rp "   Mindestfreiraum vor Backup in MB [4096]: " BACKUP_MIN_FREE_MB
-    BACKUP_MIN_FREE_MB="${BACKUP_MIN_FREE_MB:-4096}"
-    if valid_int "$BACKUP_MIN_FREE_MB"; then
-      break
-    fi
-    echo "   ❌ Bitte eine Ganzzahl eingeben"
-  done
+fi
+}
 
-  echo ""
-  echo "📂 Borg Exclude-Liste konfigurieren"
-  BORG_EXCLUDES=()
-
-  read -rp "   Log-Verzeichnis (${DATA_DIR}/log) ausschließen? (j/n) [j]: " excl_log
-  [[ "${excl_log:-j}" == "j" ]] && BORG_EXCLUDES+=("${DATA_DIR}/log")
-  BORG_EXCLUDES+=("${DATA_DIR}/celerybeat-schedule.db")
-
-  if [[ -d "${DATA_DIR}/nltk" ]]; then
-    read -rp "   NLTK-Daten (${DATA_DIR}/nltk) ausschließen? (j/n) [j]: " excl_nltk
-    [[ "${excl_nltk:-j}" == "j" ]] && BORG_EXCLUDES+=("${DATA_DIR}/nltk")
+setup_init_borg() {
+echo ""
+echo "🔐 Borg Repository..."
+if [[ -f "${BORG_REPO}/config" ]]; then
+  echo "   ℹ️  Bestehendes Repository erkannt – Passphrase wird beibehalten."
+  check_passphrase
+else
+  local passphrase
+  passphrase=$(openssl rand -base64 32)
+  if [[ -f "$PASSPHRASE_FILE" ]]; then
+    local pass_backup
+    pass_backup="${PASSPHRASE_FILE}.bak-$(date +%Y%m%d-%H%M%S)"
+    cp -a "$PASSPHRASE_FILE" "$pass_backup"
+    echo "   ℹ️  Vorhandene Passphrase gesichert nach ${pass_backup}"
   fi
-
-  read -rp "   Export-Verzeichnis (${EXPORT_DIR}) ausschließen? (j/n) [n]: " excl_export
-  [[ "${excl_export:-n}" == "j" ]] && BORG_EXCLUDES+=("${EXPORT_DIR}")
-
-  BORG_EXCLUDES+=("*.tmp" "*.swp" "*.lock")
-
-  read -rp "   Weitere Pfade/Muster hinzufügen? (j/n): " add_more
-  while [[ "$add_more" == "j" ]]; do
-    read -rp "   Pfad oder Muster: " custom_excl
-    if valid_exclude "$custom_excl"; then
-      BORG_EXCLUDES+=("$custom_excl")
-    else
-      echo "   ❌ Ungültiges Muster – wird übersprungen"
-    fi
-    read -rp "   Noch einen? (j/n): " add_more
-  done
+  install -m 600 /dev/null "$PASSPHRASE_FILE"
+  printf '%s\n' "$passphrase" > "$PASSPHRASE_FILE"
+  export BORG_PASSCOMMAND="cat ${PASSPHRASE_FILE}"
+  borg init --encryption=repokey "$BORG_REPO"
+  echo "   ✅ Repository initialisiert"
 
   echo ""
-  echo "📄 Document-Exporter"
-  read -rp "   Aktivieren? (j/n) [n]: " enable_exporter
-  ENABLE_DOCUMENT_EXPORTER="false"
-  EXPORTER_DEST="/usr/src/paperless/export"
-  if [[ "${enable_exporter:-n}" == "j" ]]; then
-    ENABLE_DOCUMENT_EXPORTER="true"
-    while true; do
-      detect_value "Export-Zielverzeichnis im Container" "/usr/src/paperless/export" EXPORTER_DEST
-      if valid_path "$EXPORTER_DEST"; then
-        break
-      fi
-      echo "   ❌ Bitte einen absoluten Pfad ohne Leerzeichen angeben"
-    done
-  fi
+  echo "┌─────────────────────────────────────────┐"
+  echo "│  ⚠️  BORG PASSPHRASE – SICHER AUFBEWAHREN │"
+  echo "├─────────────────────────────────────────┤"
+  echo "│  ${passphrase}"
+  echo "│  Gespeichert: ${PASSPHRASE_FILE}"
+  echo "│  → extern sichern! (Single Point of     │"
+  echo "│    Failure bei Verlust)                 │"
+  echo "└─────────────────────────────────────────┘"
+  read -rp "Passphrase notiert und extern gesichert? (Enter)"
+  unset passphrase
+fi
 
-  echo ""
-  echo "💾 Speichere Konfiguration nach ${CONF_FILE}..."
-  _check_collected_values
-  write_conf
-  echo "   ✅ Konfiguration gespeichert (chmod 600)"
-
-  install -d -m 700 "$BORG_REPO"
-  install -d -m 700 "$BACKUP_TMP"
-  install -d -m 700 "$RESTORE_TEST_DIR"
-
-  echo ""
-  echo "🔐 Borg Repository..."
-  if [[ -f "${BORG_REPO}/config" ]]; then
-    echo "   ℹ️  Bestehendes Repository erkannt – Passphrase wird beibehalten."
-    check_passphrase
-  else
-    local passphrase
-    passphrase=$(openssl rand -base64 32)
-    if [[ -f "$PASSPHRASE_FILE" ]]; then
-      local pass_backup
-      pass_backup="${PASSPHRASE_FILE}.bak-$(date +%Y%m%d-%H%M%S)"
-      cp -a "$PASSPHRASE_FILE" "$pass_backup"
-      echo "   ℹ️  Vorhandene Passphrase gesichert nach ${pass_backup}"
-    fi
-    install -m 600 /dev/null "$PASSPHRASE_FILE"
-    printf '%s\n' "$passphrase" > "$PASSPHRASE_FILE"
-    export BORG_PASSCOMMAND="cat ${PASSPHRASE_FILE}"
-    borg init --encryption=repokey "$BORG_REPO"
-    echo "   ✅ Repository initialisiert"
-
-    echo ""
-    echo "┌─────────────────────────────────────────┐"
-    echo "│  ⚠️  BORG PASSPHRASE – SICHER AUFBEWAHREN │"
-    echo "├─────────────────────────────────────────┤"
-    echo "│  ${passphrase}"
-    echo "│  Gespeichert: ${PASSPHRASE_FILE}"
-    echo "│  → extern sichern! (Single Point of     │"
-    echo "│    Failure bei Verlust)                 │"
-    echo "└─────────────────────────────────────────┘"
-    read -rp "Passphrase notiert und extern gesichert? (Enter)"
-    unset passphrase
-  fi
-
-  send_telegram "✅ Paperless Backup Setup abgeschlossen
+send_telegram "✅ Paperless Backup Setup abgeschlossen
 📦 Ziele: $(IFS=', '; echo "${BACKUP_TARGETS[*]}")
 🖥 Host: $(hostname)
 📅 $(date '+%Y-%m-%d %H:%M')"
+}
 
-  generate_scripts
-  setup_systemd
+setup_finish() {
+generate_scripts
+setup_systemd
 
-  echo ""
-  echo "✅ Setup erfolgreich abgeschlossen!"
-  read -rp "Jetzt einen Test-Backup starten? (j/n): " do_test
-  [[ "$do_test" == "j" ]] && run_test
+echo ""
+echo "✅ Setup erfolgreich abgeschlossen!"
+read -rp "Jetzt einen Test-Backup starten? (j/n): " do_test
+[[ "$do_test" == "j" ]] && run_test
 }
 
 # ─────────────────────────────────────────────
@@ -1727,36 +1862,36 @@ run_setup() {
 # ─────────────────────────────────────────────
 
 generate_lib() {
-  local self="${BASH_SOURCE[0]}"
-  if command -v readlink >/dev/null 2>&1; then
-    self="$(readlink -f "$self" 2>/dev/null || printf '%s' "$self")"
-  fi
+local self="${BASH_SOURCE[0]}"
+if command -v readlink >/dev/null 2>&1; then
+  self="$(readlink -f "$self" 2>/dev/null || printf '%s' "$self")"
+fi
 
-  if ! grep -q '^# >>> PABO COMMON BEGIN' "$self" 2>/dev/null; then
-    echo "❌ Gemeinsamer Code-Block in ${self} nicht gefunden – Script beschädigt?"
-    exit 1
-  fi
+if ! grep -q '^# >>> PABO COMMON BEGIN' "$self" 2>/dev/null; then
+  echo "❌ Gemeinsamer Code-Block in ${self} nicht gefunden – Script beschädigt?"
+  exit 1
+fi
 
-  local tmp
-  tmp=$(mktemp) || { echo "❌ Konnte Tempfile nicht anlegen"; exit 1; }
+local tmp
+tmp=$(mktemp) || { echo "❌ Konnte Tempfile nicht anlegen"; exit 1; }
 
-  {
-    printf '#!/bin/bash\n'
-    printf '# Automatisch generiert von pabo.sh v%s – nicht manuell bearbeiten.\n' "$PABO_VERSION"
-    printf 'set -euo pipefail\numask 077\n\n'
-    sed -n '/^# >>> PABO COMMON BEGIN/,/^# <<< PABO COMMON END/p' "$self" \
-      | grep -vE '^# (>>>|<<<) PABO COMMON (BEGIN|END)$'
-  } > "$tmp"
+{
+  printf '#!/bin/bash\n'
+  printf '# Automatisch generiert von pabo.sh v%s – nicht manuell bearbeiten.\n' "$PABO_VERSION"
+  printf 'set -euo pipefail\numask 077\n\n'
+  sed -n '/^# >>> PABO COMMON BEGIN/,/^# <<< PABO COMMON END/p' "$self" \
+    | grep -vE '^# (>>>|<<<) PABO COMMON (BEGIN|END)$'
+} > "$tmp"
 
-  install -m 644 "$tmp" "$LIB_FILE"
-  rm -f "$tmp"
-  echo "   ✅ ${LIB_FILE}"
+install -m 644 "$tmp" "$LIB_FILE"
+rm -f "$tmp"
+echo "   ✅ ${LIB_FILE}"
 }
 
 write_script() {
-  local name="$1" log_line="$2" entry="$3"
-  local path="${SCRIPT_DIR}/${name}"
-  cat > "$path" <<EOF
+local name="$1" log_line="$2" entry="$3"
+local path="${SCRIPT_DIR}/${name}"
+cat > "$path" <<EOF
 #!/bin/bash
 set -euo pipefail
 source ${LIB_FILE}
@@ -1764,34 +1899,35 @@ ${log_line}
 load_conf
 require_root
 log "ℹ️  Host-Kennung: \$(pabo_identity)"
+check_backup_freshness || true
 ${entry}
 EOF
-  chmod 755 "$path"
-  echo "   ✅ ${path}"
+chmod 755 "$path"
+echo "   ✅ ${path}"
 }
 
 generate_scripts() {
-  if [[ "${_SETUP_VARS_LOADED:-0}" -ne 1 ]]; then
-    load_conf
-  fi
+if [[ "${_SETUP_VARS_LOADED:-0}" -ne 1 ]]; then
+  load_conf
+fi
 
-  echo ""
-  echo "📝 Generiere Backup-Scripts..."
-  install -d -m 755 /usr/local/lib
+echo ""
+echo "📝 Generiere Backup-Scripts..."
+install -d -m 755 /usr/local/lib
 
-  generate_lib
+generate_lib
 
-  write_script "paperless-backup.sh" \
-    "LOG_FILE=\"/var/log/paperless-backup.log\"" \
-    "run_backup false"
+write_script "paperless-backup.sh" \
+  "LOG_FILE=\"/var/log/paperless-backup.log\"" \
+  "run_backup false"
 
-  write_script "paperless-borg-check.sh" \
-    "LOG_FILE=\"/var/log/paperless-borg-check.log\"" \
-    "run_borg_check"
+write_script "paperless-borg-check.sh" \
+  "LOG_FILE=\"/var/log/paperless-borg-check.log\"" \
+  "run_borg_check"
 
-  write_script "paperless-restore-test.sh" \
-    "LOG_FILE=\"/var/log/paperless-restore-test.log\"" \
-    "run_restore_test"
+write_script "paperless-restore-test.sh" \
+  "LOG_FILE=\"/var/log/paperless-restore-test.log\"" \
+  "run_restore_test"
 }
 
 # ─────────────────────────────────────────────
@@ -1799,16 +1935,16 @@ generate_scripts() {
 # ─────────────────────────────────────────────
 
 setup_systemd() {
-  if [[ "${_SETUP_VARS_LOADED:-0}" -ne 1 ]]; then
-    load_conf
-  fi
-  echo ""
-  echo "⚙️  Richte Systemd Services und Timer ein..."
+if [[ "${_SETUP_VARS_LOADED:-0}" -ne 1 ]]; then
+  load_conf
+fi
+echo ""
+echo "⚙️  Richte Systemd Services und Timer ein..."
 
-  create_service_timer() {
-    local NAME="$1" SCRIPT="$2" DESCRIPTION="$3" SCHEDULE="$4"
+create_service_timer() {
+  local NAME="$1" SCRIPT="$2" DESCRIPTION="$3" SCHEDULE="$4"
 
-    cat > "/etc/systemd/system/${NAME}.service" <<EOF
+  cat > "/etc/systemd/system/${NAME}.service" <<EOF
 [Unit]
 Description=${DESCRIPTION}
 After=docker.service network-online.target
@@ -1826,9 +1962,9 @@ NoNewPrivileges=true
 StandardOutput=journal
 StandardError=journal
 EOF
-    chmod 644 "/etc/systemd/system/${NAME}.service"
+  chmod 644 "/etc/systemd/system/${NAME}.service"
 
-    cat > "/etc/systemd/system/${NAME}.timer" <<EOF
+  cat > "/etc/systemd/system/${NAME}.timer" <<EOF
 [Unit]
 Description=Timer für ${DESCRIPTION}
 
@@ -1841,33 +1977,38 @@ AccuracySec=1min
 [Install]
 WantedBy=timers.target
 EOF
-    chmod 644 "/etc/systemd/system/${NAME}.timer"
-  }
+  chmod 644 "/etc/systemd/system/${NAME}.timer"
+}
 
-  create_service_timer "paperless-backup" \
-    "${SCRIPT_DIR}/paperless-backup.sh" \
-    "Tägliches Paperless Backup" \
-    "*-*-* 02:00:00"
-  echo "   ✅ paperless-backup.timer (täglich 02:00)"
+create_service_timer "paperless-backup" \
+  "${SCRIPT_DIR}/paperless-backup.sh" \
+  "Tägliches Paperless Backup" \
+  "*-*-* 02:00:00"
+echo "   ✅ paperless-backup.timer (täglich 02:00)"
 
-  create_service_timer "paperless-borg-check" \
-    "${SCRIPT_DIR}/paperless-borg-check.sh" \
-    "Wöchentlicher Borg Repository Check" \
-    "Sun *-*-* 03:00:00"
-  echo "   ✅ paperless-borg-check.timer (Sonntag 03:00)"
+create_service_timer "paperless-borg-check" \
+  "${SCRIPT_DIR}/paperless-borg-check.sh" \
+  "Wöchentlicher Borg Repository Check" \
+  "Sun *-*-* 03:00:00"
+echo "   ✅ paperless-borg-check.timer (Sonntag 03:00)"
 
-  create_service_timer "paperless-restore-test" \
-    "${SCRIPT_DIR}/paperless-restore-test.sh" \
-    "Wöchentlicher Restore Dry-Run Test" \
-    "Sun *-*-* 04:00:00"
-  echo "   ✅ paperless-restore-test.timer (Sonntag 04:00)"
+create_service_timer "paperless-restore-test" \
+  "${SCRIPT_DIR}/paperless-restore-test.sh" \
+  "Wöchentlicher Restore Dry-Run Test" \
+  "Sun *-*-* 04:00:00"
+echo "   ✅ paperless-restore-test.timer (Sonntag 04:00)"
 
-  systemctl daemon-reload
-  local unit
-  for unit in paperless-backup.timer paperless-borg-check.timer paperless-restore-test.timer; do
-    systemctl enable --now "$unit"
-  done
-  echo "   ✅ Alle Timer aktiviert"
+systemctl daemon-reload
+local unit
+for unit in paperless-backup.timer paperless-borg-check.timer paperless-restore-test.timer; do
+  systemctl enable --now "$unit"
+done
+echo "   ✅ Alle Timer aktiviert"
+
+# Logrotation: die Logs wachsen sonst unbegrenzt
+if [[ "${setup_logrotate:-j}" == "j" ]]; then
+  setup_logrotate_config || true
+fi
 }
 
 # ─────────────────────────────────────────────
@@ -1875,233 +2016,233 @@ EOF
 # ─────────────────────────────────────────────
 
 run_restore() {
-  require_root
-  load_conf
-  check_passphrase
-  export BORG_PASSCOMMAND="cat ${PASSPHRASE_FILE}"
+require_root
+load_conf
+check_passphrase
+export BORG_PASSCOMMAND="cat ${PASSPHRASE_FILE}"
 
-  echo "╔══════════════════════════════════════╗"
-  echo "║     Paperless Restore                ║"
-  echo "╚══════════════════════════════════════╝"
-  echo ""
-  echo "☁️  Von welchem Cloud-Ziel wiederherstellen?"
-  local i
-  for i in "${!BACKUP_TARGETS[@]}"; do
-    echo "  $((i+1))) ${BACKUP_TARGETS[$i]}"
-  done
-  local target_idx
-  prompt_int "Auswahl: " 1 "${#BACKUP_TARGETS[@]}" target_idx
-  local SELECTED_TARGET="${BACKUP_TARGETS[$((target_idx-1))]}"
-  local REMOTE_NAME="${SELECTED_TARGET%%:*}"
-  local REMOTE_PATH="${SELECTED_TARGET#*:}"
+echo "╔══════════════════════════════════════╗"
+echo "║     Paperless Restore                ║"
+echo "╚══════════════════════════════════════╝"
+echo ""
+echo "☁️  Von welchem Cloud-Ziel wiederherstellen?"
+local i
+for i in "${!BACKUP_TARGETS[@]}"; do
+  echo "  $((i+1))) ${BACKUP_TARGETS[$i]}"
+done
+local target_idx
+prompt_int "Auswahl: " 1 "${#BACKUP_TARGETS[@]}" target_idx
+local SELECTED_TARGET="${BACKUP_TARGETS[$((target_idx-1))]}"
+local REMOTE_NAME="${SELECTED_TARGET%%:*}"
+local REMOTE_PATH="${SELECTED_TARGET#*:}"
 
-  echo ""
-  echo "📥 Lade Borg-Repository von ${SELECTED_TARGET} nach ${RESTORE_REPO}..."
-  install -d -m 700 "$RESTORE_REPO"
+echo ""
+echo "📥 Lade Borg-Repository von ${SELECTED_TARGET} nach ${RESTORE_REPO}..."
+install -d -m 700 "$RESTORE_REPO"
 
-  # Platzprüfung: das Repo belegt das Dateisystem ein zweites Mal.
-  local remote_bytes need_kb free_kb
-  remote_bytes=$(rclone size --json "${REMOTE_NAME}:${REMOTE_PATH}" 2>/dev/null \
-                   | jq -r '.bytes // 0') || remote_bytes=0
-  if [[ ! "$remote_bytes" =~ ^[0-9]+$ ]] || (( remote_bytes == 0 )); then
-    echo "❌ Remote-Größe nicht ermittelbar – Download abgebrochen, ohne blind zu schreiben."
-    exit "$EXIT_RESTORE"
-  fi
-  need_kb=$(( remote_bytes * 11 / 10 / 1024 ))
-  if ! free_kb=$(fs_free_kb "$RESTORE_REPO"); then
-    echo "❌ Freier Platz nicht ermittelbar – Download abgebrochen, ohne blind zu schreiben."
-    exit "$EXIT_RESTORE"
-  fi
-  if (( free_kb < need_kb )); then
-    echo "❌ Nicht genug Platz: $(( free_kb / 1024 )) MB frei unter ${RESTORE_REPO}, benötigt werden $(( need_kb / 1024 )) MB."
-    send_telegram "❌ Restore abgebrochen
+# Platzprüfung: das Repo belegt das Dateisystem ein zweites Mal.
+local remote_bytes need_kb free_kb
+remote_bytes=$(rclone size --json "${REMOTE_NAME}:${REMOTE_PATH}" 2>/dev/null \
+                 | jq -r '.bytes // 0') || remote_bytes=0
+if [[ ! "$remote_bytes" =~ ^[0-9]+$ ]] || (( remote_bytes == 0 )); then
+  echo "❌ Remote-Größe nicht ermittelbar – Download abgebrochen, ohne blind zu schreiben."
+  exit "$EXIT_RESTORE"
+fi
+need_kb=$(( remote_bytes * 11 / 10 / 1024 ))
+if ! free_kb=$(fs_free_kb "$RESTORE_REPO"); then
+  echo "❌ Freier Platz nicht ermittelbar – Download abgebrochen, ohne blind zu schreiben."
+  exit "$EXIT_RESTORE"
+fi
+if (( free_kb < need_kb )); then
+  echo "❌ Nicht genug Platz: $(( free_kb / 1024 )) MB frei unter ${RESTORE_REPO}, benötigt werden $(( need_kb / 1024 )) MB."
+  send_telegram "❌ Restore abgebrochen
 ⚠️ Nicht genug Platz für den Download aus ${SELECTED_TARGET}
 🔢 Exit-Code: ${EXIT_RESTORE}"
-    exit "$EXIT_RESTORE"
-  fi
-  local rclone_opts=(
-    --transfers "${RCLONE_TRANSFERS}"
-    --checkers  "${RCLONE_CHECKERS}"
-  )
-  if [[ -n "${RCLONE_BWLIMIT}" ]]; then
-    rclone_opts+=(--bwlimit "${RCLONE_BWLIMIT}")
-  fi
-  if ! rclone copy "${REMOTE_NAME}:${REMOTE_PATH}" "${RESTORE_REPO}" "${rclone_opts[@]}"; then
-    echo "❌ Download von ${SELECTED_TARGET} fehlgeschlagen."
-    exit "$EXIT_RESTORE"
-  fi
+  exit "$EXIT_RESTORE"
+fi
+local rclone_opts=(
+  --transfers "${RCLONE_TRANSFERS}"
+  --checkers  "${RCLONE_CHECKERS}"
+)
+if [[ -n "${RCLONE_BWLIMIT}" ]]; then
+  rclone_opts+=(--bwlimit "${RCLONE_BWLIMIT}")
+fi
+if ! rclone copy "${REMOTE_NAME}:${REMOTE_PATH}" "${RESTORE_REPO}" "${rclone_opts[@]}"; then
+  echo "❌ Download von ${SELECTED_TARGET} fehlgeschlagen."
+  exit "$EXIT_RESTORE"
+fi
 
-  echo ""
-  echo "🔍 Prüfe heruntergeladenes Repository..."
-  if ! borg check "${RESTORE_REPO}" 2>&1 | tail -20; then
-    echo "⚠️  Das heruntergeladene Repository meldet Auffälligkeiten."
-    read -rp "   Trotzdem fortfahren? (ja/nein): " check_ok
-    [[ "$check_ok" != "ja" ]] && { echo "Abgebrochen."; exit 0; }
-  fi
+echo ""
+echo "🔍 Prüfe heruntergeladenes Repository..."
+if ! borg check "${RESTORE_REPO}" 2>&1 | tail -20; then
+  echo "⚠️  Das heruntergeladene Repository meldet Auffälligkeiten."
+  read -rp "   Trotzdem fortfahren? (ja/nein): " check_ok
+  [[ "$check_ok" != "ja" ]] && { echo "Abgebrochen."; exit 0; }
+fi
 
-  echo ""
-  echo "📋 Verfügbare Archive:"
-  local archives=()
-  mapfile -t archives < <(borg list --short "${RESTORE_REPO}" 2>/dev/null || true)
-  if (( ${#archives[@]} == 0 )); then
-    echo "❌ Keine Archive in ${RESTORE_REPO} gefunden."
-    exit "$EXIT_RESTORE"
-  fi
-  for i in "${!archives[@]}"; do
-    echo "  $((i+1))) ${archives[$i]}"
-  done
-  echo ""
-  read -rp "Archiv-Name eingeben: " ARCHIVE_NAME
-  local known=0 a
-  for a in "${archives[@]}"; do
-    [[ "$a" == "$ARCHIVE_NAME" ]] && known=1
-  done
-  if (( known == 0 )); then
-    echo "❌ Archiv '${ARCHIVE_NAME}' existiert nicht."
-    exit "$EXIT_RESTORE"
-  fi
+echo ""
+echo "📋 Verfügbare Archive:"
+local archives=()
+mapfile -t archives < <(borg list --short "${RESTORE_REPO}" 2>/dev/null || true)
+if (( ${#archives[@]} == 0 )); then
+  echo "❌ Keine Archive in ${RESTORE_REPO} gefunden."
+  exit "$EXIT_RESTORE"
+fi
+for i in "${!archives[@]}"; do
+  echo "  $((i+1))) ${archives[$i]}"
+done
+echo ""
+read -rp "Archiv-Name eingeben: " ARCHIVE_NAME
+local known=0 a
+for a in "${archives[@]}"; do
+  [[ "$a" == "$ARCHIVE_NAME" ]] && known=1
+done
+if (( known == 0 )); then
+  echo "❌ Archiv '${ARCHIVE_NAME}' existiert nicht."
+  exit "$EXIT_RESTORE"
+fi
 
-  echo ""
-  echo "🔧 Restore-Typ wählen:"
-  echo "  1) Voll-Restore (Media + Data + compose + DB)"
-  echo "  2) Nur Datenbank"
-  echo "  3) Nur Media-Verzeichnis"
-  echo "  4) Nur Data-Verzeichnis"
-  echo "  5) Restore in alternatives Zielverzeichnis (z.B. Staging)"
-  local restore_type
-  prompt_int "Auswahl (1-5): " 1 5 restore_type
+echo ""
+echo "🔧 Restore-Typ wählen:"
+echo "  1) Voll-Restore (Media + Data + compose + DB)"
+echo "  2) Nur Datenbank"
+echo "  3) Nur Media-Verzeichnis"
+echo "  4) Nur Data-Verzeichnis"
+echo "  5) Restore in alternatives Zielverzeichnis (z.B. Staging)"
+local restore_type
+prompt_int "Auswahl (1-5): " 1 5 restore_type
 
-  local TARGET_PREFIX="/"
-  if [[ "$restore_type" == "5" ]]; then
-    while true; do
-      read -rp "Ziel-Basisverzeichnis (z.B. /tmp/paperless-staging): " TARGET_PREFIX
-      if valid_path "$TARGET_PREFIX"; then
-        break
-      fi
-      echo "   ❌ Bitte absoluten Pfad ohne Leerzeichen angeben"
-    done
-    install -d -m 700 "$TARGET_PREFIX" || {
-      echo "❌ Konnte Zielverzeichnis nicht erstellen: ${TARGET_PREFIX}"
-      exit 1
-    }
-    restore_type="1"
-    echo "   Restore nach: ${TARGET_PREFIX}"
-  fi
-
-  echo ""
-  echo "⚠️  ACHTUNG: Daten werden nach ${TARGET_PREFIX} wiederhergestellt!"
-  if [[ "$TARGET_PREFIX" == "/" ]]; then
-    echo "   Das überschreibt die laufende Installation."
-    local confirm_name
-    read -rp "Archivnamen zur Bestätigung erneut eingeben: " confirm_name
-    if [[ "$confirm_name" != "$ARCHIVE_NAME" ]]; then
-      echo "Abgebrochen."
-      exit 0
+local TARGET_PREFIX="/"
+if [[ "$restore_type" == "5" ]]; then
+  while true; do
+    read -rp "Ziel-Basisverzeichnis (z.B. /tmp/paperless-staging): " TARGET_PREFIX
+    if valid_path "$TARGET_PREFIX"; then
+      break
     fi
+    echo "   ❌ Bitte absoluten Pfad ohne Leerzeichen angeben"
+  done
+  install -d -m 700 "$TARGET_PREFIX" || {
+    echo "❌ Konnte Zielverzeichnis nicht erstellen: ${TARGET_PREFIX}"
+    exit 1
+  }
+  restore_type="1"
+  echo "   Restore nach: ${TARGET_PREFIX}"
+fi
+
+echo ""
+echo "⚠️  ACHTUNG: Daten werden nach ${TARGET_PREFIX} wiederhergestellt!"
+if [[ "$TARGET_PREFIX" == "/" ]]; then
+  echo "   Das überschreibt die laufende Installation."
+  local confirm_name
+  read -rp "Archivnamen zur Bestätigung erneut eingeben: " confirm_name
+  if [[ "$confirm_name" != "$ARCHIVE_NAME" ]]; then
+    echo "Abgebrochen."
+    exit 0
   fi
-  read -rp "Fortfahren? (ja/nein): " confirm
-  [[ "$confirm" != "ja" ]] && { echo "Abgebrochen."; exit 0; }
+fi
+read -rp "Fortfahren? (ja/nein): " confirm
+[[ "$confirm" != "ja" ]] && { echo "Abgebrochen."; exit 0; }
 
-  local stopped=0
-  if [[ "$TARGET_PREFIX" == "/" ]] \
-     && docker ps --format '{{.Names}}' | grep -qx "${PAPERLESS_CONTAINER}"; then
-    echo "🐳 Stoppe ${PAPERLESS_CONTAINER}..."
-    docker stop "${PAPERLESS_CONTAINER}" >/dev/null
-    stopped=1
-  fi
+local stopped=0
+if [[ "$TARGET_PREFIX" == "/" ]] \
+   && docker ps --format '{{.Names}}' | grep -qx "${PAPERLESS_CONTAINER}"; then
+  echo "🐳 Stoppe ${PAPERLESS_CONTAINER}..."
+  docker stop "${PAPERLESS_CONTAINER}" >/dev/null
+  stopped=1
+fi
 
-  local db_rel="${BACKUP_TMP#/}/paperless-db.sql"
+local db_rel="${BACKUP_TMP#/}/paperless-db.sql"
 
-  if [[ "$restore_type" == "1" || "$restore_type" == "3" ]]; then
-    echo "📂 Stelle Media wieder her..."
-    if ! ( cd "$TARGET_PREFIX" && borg extract "${RESTORE_REPO}::${ARCHIVE_NAME}" "${MEDIA_DIR#/}" ); then
-      send_telegram "❌ Restore fehlgeschlagen
+if [[ "$restore_type" == "1" || "$restore_type" == "3" ]]; then
+  echo "📂 Stelle Media wieder her..."
+  if ! ( cd "$TARGET_PREFIX" && borg extract "${RESTORE_REPO}::${ARCHIVE_NAME}" "${MEDIA_DIR#/}" ); then
+    send_telegram "❌ Restore fehlgeschlagen
 🔴 Fehler: [MEDIA] borg extract
 🔢 Exit-Code: ${EXIT_RESTORE}"
-      exit "$EXIT_RESTORE"
-    fi
-    echo "   ✅ Media wiederhergestellt"
+    exit "$EXIT_RESTORE"
   fi
+  echo "   ✅ Media wiederhergestellt"
+fi
 
-  if [[ "$restore_type" == "1" || "$restore_type" == "4" ]]; then
-    echo "📁 Stelle Data wieder her..."
-    if ! ( cd "$TARGET_PREFIX" && borg extract "${RESTORE_REPO}::${ARCHIVE_NAME}" "${DATA_DIR#/}" ); then
-      send_telegram "❌ Restore fehlgeschlagen
+if [[ "$restore_type" == "1" || "$restore_type" == "4" ]]; then
+  echo "📁 Stelle Data wieder her..."
+  if ! ( cd "$TARGET_PREFIX" && borg extract "${RESTORE_REPO}::${ARCHIVE_NAME}" "${DATA_DIR#/}" ); then
+    send_telegram "❌ Restore fehlgeschlagen
 🔴 Fehler: [DATA] borg extract
 🔢 Exit-Code: ${EXIT_RESTORE}"
-      exit "$EXIT_RESTORE"
-    fi
-    echo "   ✅ Data wiederhergestellt"
+    exit "$EXIT_RESTORE"
   fi
+  echo "   ✅ Data wiederhergestellt"
+fi
 
-  if [[ "$restore_type" == "1" ]]; then
-    echo "📄 Stelle docker-compose.yml wieder her..."
-    if ! ( cd "$TARGET_PREFIX" && borg extract "${RESTORE_REPO}::${ARCHIVE_NAME}" "${COMPOSE_FILE#/}" ); then
-      echo "   ⚠️  docker-compose.yml konnte nicht wiederhergestellt werden"
-    else
-      echo "   ✅ docker-compose.yml wiederhergestellt"
-    fi
+if [[ "$restore_type" == "1" ]]; then
+  echo "📄 Stelle docker-compose.yml wieder her..."
+  if ! ( cd "$TARGET_PREFIX" && borg extract "${RESTORE_REPO}::${ARCHIVE_NAME}" "${COMPOSE_FILE#/}" ); then
+    echo "   ⚠️  docker-compose.yml konnte nicht wiederhergestellt werden"
+  else
+    echo "   ✅ docker-compose.yml wiederhergestellt"
   fi
+fi
 
-  if [[ "$restore_type" == "1" || "$restore_type" == "2" ]]; then
-    if ! container_running "${DB_CONTAINER}"; then
-      echo "❌ Datenbank-Container '${DB_CONTAINER}' läuft nicht – DB-Restore nicht möglich."
-      echo "   Erst den Container starten (docker compose up -d), dann erneut."
-      send_telegram "❌ Restore fehlgeschlagen
+if [[ "$restore_type" == "1" || "$restore_type" == "2" ]]; then
+  if ! container_running "${DB_CONTAINER}"; then
+    echo "❌ Datenbank-Container '${DB_CONTAINER}' läuft nicht – DB-Restore nicht möglich."
+    echo "   Erst den Container starten (docker compose up -d), dann erneut."
+    send_telegram "❌ Restore fehlgeschlagen
 🔴 Datenbank-Container '${DB_CONTAINER}' läuft nicht
 🔢 Exit-Code: ${EXIT_RESTORE}"
-      exit "$EXIT_RESTORE"
-    fi
-    echo "🗃 Stelle Datenbank wieder her..."
-    local db_tmp
-    db_tmp=$(mktemp -d)
-    if ( cd "$db_tmp" && borg extract "${RESTORE_REPO}::${ARCHIVE_NAME}" "${db_rel}" ); then
-      if docker exec -i "${DB_CONTAINER}" psql -U "${DB_USER}" "${DB_NAME}" \
-           -v ON_ERROR_STOP=1 \
-           < "${db_tmp}/${db_rel}"; then
-        echo "   ✅ Datenbank wiederhergestellt"
-      else
-        rm -rf "$db_tmp"
-        send_telegram "❌ Restore fehlgeschlagen
-🔴 Fehler: [DB] psql restore
-🔢 Exit-Code: ${EXIT_RESTORE}"
-        exit "$EXIT_RESTORE"
-      fi
+    exit "$EXIT_RESTORE"
+  fi
+  echo "🗃 Stelle Datenbank wieder her..."
+  local db_tmp
+  db_tmp=$(mktemp -d)
+  if ( cd "$db_tmp" && borg extract "${RESTORE_REPO}::${ARCHIVE_NAME}" "${db_rel}" ); then
+    if docker exec -i "${DB_CONTAINER}" psql -U "${DB_USER}" "${DB_NAME}" \
+         -v ON_ERROR_STOP=1 \
+         < "${db_tmp}/${db_rel}"; then
+      echo "   ✅ Datenbank wiederhergestellt"
     else
       rm -rf "$db_tmp"
       send_telegram "❌ Restore fehlgeschlagen
-🔴 Fehler: [DB] borg extract (${db_rel})
+🔴 Fehler: [DB] psql restore
 🔢 Exit-Code: ${EXIT_RESTORE}"
       exit "$EXIT_RESTORE"
     fi
+  else
     rm -rf "$db_tmp"
+    send_telegram "❌ Restore fehlgeschlagen
+🔴 Fehler: [DB] borg extract (${db_rel})
+🔢 Exit-Code: ${EXIT_RESTORE}"
+    exit "$EXIT_RESTORE"
   fi
+  rm -rf "$db_tmp"
+fi
 
-  if (( stopped == 1 )); then
-    echo ""
-    echo "🐳 Starte Paperless..."
-    docker compose -f "${COMPOSE_FILE}" up -d \
-      || docker start "${PAPERLESS_CONTAINER}" >/dev/null
-  fi
-
+if (( stopped == 1 )); then
   echo ""
-  echo "✅ Restore abgeschlossen!"
-  send_telegram "✅ Paperless Restore abgeschlossen
+  echo "🐳 Starte Paperless..."
+  docker compose -f "${COMPOSE_FILE}" up -d \
+    || docker start "${PAPERLESS_CONTAINER}" >/dev/null
+fi
+
+echo ""
+echo "✅ Restore abgeschlossen!"
+send_telegram "✅ Paperless Restore abgeschlossen
 🗄 Archiv: ${ARCHIVE_NAME}
 ☁️ Quelle: ${SELECTED_TARGET}
 📁 Ziel: ${TARGET_PREFIX}"
 
-  # Das heruntergeladene Repo bleibt sonst als Doppelter der
-  # Datenmenge dauerhaft auf der Platte liegen.
-  if [[ -d "${RESTORE_REPO}" && -O "${RESTORE_REPO}" ]]; then
-    local restore_size
-    restore_size=$(du -sh "${RESTORE_REPO}" 2>/dev/null | cut -f1 || echo "?")
-    read -rp "   Heruntergeladenes Restore-Repo (${restore_size}) löschen? (j/n) [j]: " del_restore
-    if [[ "${del_restore:-j}" == "j" ]]; then
-      rm -rf "${RESTORE_REPO}"
-      echo "   ✅ Restore-Repo gelöscht"
-    fi
+# Das heruntergeladene Repo bleibt sonst als Doppelter der
+# Datenmenge dauerhaft auf der Platte liegen.
+if [[ -d "${RESTORE_REPO}" && -O "${RESTORE_REPO}" ]]; then
+  local restore_size
+  restore_size=$(du -sh "${RESTORE_REPO}" 2>/dev/null | cut -f1 || echo "?")
+  read -rp "   Heruntergeladenes Restore-Repo (${restore_size}) löschen? (j/n) [j]: " del_restore
+  if [[ "${del_restore:-j}" == "j" ]]; then
+    rm -rf "${RESTORE_REPO}"
+    echo "   ✅ Restore-Repo gelöscht"
   fi
+fi
 }
 
 # ─────────────────────────────────────────────
@@ -2109,181 +2250,273 @@ run_restore() {
 # ─────────────────────────────────────────────
 
 run_test() {
-  require_root
-  load_conf
+require_root
+load_conf
 
-  echo ""
-  echo "🧪 Test auswählen:"
-  echo "  1) Backup (Archiv + Upload in alle Ziele)"
-  echo "  2) Backup Dry-Run (kein Archiv, kein Upload)"
-  echo "  3) Upload → Ziel auswählen"
-  echo "  4) Borg Check"
-  echo "  5) Restore Dry-Run Test"
-  local choice
-  prompt_int "Auswahl (1-5): " 1 5 choice
+echo ""
+echo "🧪 Test auswählen:"
+echo "  1) Backup (Archiv + Upload in alle Ziele)"
+echo "  2) Backup Dry-Run (kein Archiv, kein Upload)"
+echo "  3) Upload → Ziel auswählen"
+echo "  4) Borg Check"
+echo "  5) Restore Dry-Run Test"
+local choice
+prompt_int "Auswahl (1-5): " 1 5 choice
 
-  case "$choice" in
-    1) run_backup false ;;
-    2) run_backup true ;;
-    3)
-      echo ""
-      echo "Upload zu welchem Ziel?"
-      local i
-      for i in "${!BACKUP_TARGETS[@]}"; do
-        echo "  $((i+1))) ${BACKUP_TARGETS[$i]}"
-      done
-      local upload_idx
-      prompt_int "Auswahl: " 1 "${#BACKUP_TARGETS[@]}" upload_idx
-      run_upload_only "${BACKUP_TARGETS[$((upload_idx-1))]}"
-      ;;
-    4) run_borg_check ;;
-    5) run_restore_test ;;
-  esac
+case "$choice" in
+  1) run_backup false ;;
+  2) run_backup true ;;
+  3)
+    echo ""
+    echo "Upload zu welchem Ziel?"
+    local i
+    for i in "${!BACKUP_TARGETS[@]}"; do
+      echo "  $((i+1))) ${BACKUP_TARGETS[$i]}"
+    done
+    local upload_idx
+    prompt_int "Auswahl: " 1 "${#BACKUP_TARGETS[@]}" upload_idx
+    run_upload_only "${BACKUP_TARGETS[$((upload_idx-1))]}"
+    ;;
+  4) run_borg_check ;;
+  5) run_restore_test ;;
+esac
 }
 
 run_status() {
-  require_root
-  load_conf
-  check_passphrase
-  export BORG_PASSCOMMAND="cat ${PASSPHRASE_FILE}"
+require_root
+load_conf
+check_passphrase
+export BORG_PASSCOMMAND="cat ${PASSPHRASE_FILE}"
 
-  echo ""
-  echo "╔══════════════════════════════════════╗"
-  echo "║     Paperless Backup Status          ║"
-  echo "╚══════════════════════════════════════╝"
+echo ""
+echo "╔══════════════════════════════════════╗"
+echo "║     Paperless Backup Status          ║"
+echo "╚══════════════════════════════════════╝"
 
-  echo ""
-  echo "🐳 Docker Container:"
-  docker ps --format "table {{.Names}}\t{{.Status}}" \
-    | grep -iE "paperless|redis|tika|gotenberg" || echo "   keine gefunden"
+echo ""
+echo "🐳 Docker Container:"
+docker ps --format "table {{.Names}}\t{{.Status}}" \
+  | grep -iE "paperless|redis|tika|gotenberg" || echo "   keine gefunden"
 
-  echo ""
-  echo "⏰ Systemd Timer:"
-  systemctl list-timers --no-pager | grep paperless || echo "   keine aktiven Timer"
+echo ""
+echo "⏰ Systemd Timer:"
+systemctl list-timers --no-pager | grep paperless || echo "   keine aktiven Timer"
 
-  echo ""
-  echo "📦 Borg Archive (letzte 5):"
-  borg list "${BORG_REPO}" 2>/dev/null | tail -5 || echo "   nicht verfügbar"
+echo ""
+echo "📦 Borg Archive (letzte 5):"
+borg list "${BORG_REPO}" 2>/dev/null | tail -5 || echo "   nicht verfügbar"
 
-  echo ""
-  echo "💾 Repository-Größe:"
-  borg_repo_size "${BORG_REPO}"
-  local repo_free
-  if repo_free=$(fs_free_kb "${BORG_REPO}"); then
-    echo "   Frei auf dem Repository-Dateisystem: $(( repo_free / 1024 / 1024 )) GB"
+echo ""
+echo "💾 Repository-Größe:"
+borg_repo_size "${BORG_REPO}"
+local repo_free
+if repo_free=$(fs_free_kb "${BORG_REPO}"); then
+  echo "   Frei auf dem Repository-Dateisystem: $(( repo_free / 1024 / 1024 )) GB"
+fi
+
+echo ""
+echo "☁️  Cloud-Ziele:"
+local t
+for t in "${BACKUP_TARGETS[@]}"; do
+  echo "   • ${t}"
+done
+
+echo ""
+echo "📋 Letzte Backup-Logs:"
+tail -5 "/var/log/paperless-backup.log" 2>/dev/null || echo "   keine Logs"
+
+echo ""
+echo "🔍 Letzter Borg Check:"
+tail -3 "/var/log/paperless-borg-check.log" 2>/dev/null || echo "   noch kein Check gelaufen"
+
+echo ""
+echo "🧪 Letzter Restore-Test:"
+tail -3 "/var/log/paperless-restore-test.log" 2>/dev/null || echo "   noch kein Test gelaufen"
+}
+
+run_config_check() {
+require_root
+load_conf
+check_passphrase
+export BORG_PASSCOMMAND="cat ${PASSPHRASE_FILE}"
+
+local ERRORS=0
+check_ok()   { echo "   ✅ $*"; }
+check_fail() { echo "   ❌ $*"; ERRORS=$(( ERRORS + 1 )); }
+check_info() { echo "   ℹ️  $*"; }
+
+echo ""
+echo "╔══════════════════════════════════════╗"
+echo "║     Paperless Config-Check           ║"
+echo "╚══════════════════════════════════════╝"
+
+echo ""
+echo "📂 Pfade:"
+if [[ -d "$MEDIA_DIR" ]]; then check_ok "Media-Verzeichnis: ${MEDIA_DIR}"; else check_fail "Media-Verzeichnis fehlt: ${MEDIA_DIR}"; fi
+if [[ -d "$DATA_DIR" ]]; then check_ok "Data-Verzeichnis: ${DATA_DIR}"; else check_fail "Data-Verzeichnis fehlt: ${DATA_DIR}"; fi
+if [[ -f "$COMPOSE_FILE" ]]; then check_ok "docker-compose.yml: ${COMPOSE_FILE}"; else check_fail "docker-compose.yml fehlt: ${COMPOSE_FILE}"; fi
+if [[ -w "$BACKUP_TMP" ]]; then check_ok "Schreibrechte auf ${BACKUP_TMP}"; else check_fail "Keine Schreibrechte auf ${BACKUP_TMP}"; fi
+if [[ -d "$BORG_REPO" ]]; then check_ok "Borg-Repository: ${BORG_REPO}"; else check_fail "Borg-Repository fehlt: ${BORG_REPO}"; fi
+
+echo ""
+echo "💾 Freier Platz:"
+local repo_free_min avail_mb
+repo_free_min="${BACKUP_MIN_FREE_MB:-4096}"
+if repo_free=$(fs_free_kb "${BORG_REPO}"); then
+  avail_mb=$(( repo_free / 1024 ))
+  if (( repo_free >= repo_free_min * 1024 )); then
+    check_ok "${avail_mb} MB frei (benötigt: ${repo_free_min} MB)"
+  else
+    check_fail "${avail_mb} MB frei (benötigt: ${repo_free_min} MB)"
   fi
+else
+  check_fail "Freier Platz nicht ermittelbar: ${BORG_REPO}"
+fi
 
+echo ""
+echo "🐳 Container:"
+if container_running "${PAPERLESS_CONTAINER}"; then
+  check_ok "Paperless-Container: ${PAPERLESS_CONTAINER}"
+else
+  check_fail "Paperless-Container läuft nicht: ${PAPERLESS_CONTAINER}"
+fi
+if container_running "${DB_CONTAINER}"; then
+  check_ok "Datenbank-Container: ${DB_CONTAINER}"
+else
+  check_fail "Datenbank-Container läuft nicht: ${DB_CONTAINER}"
+fi
+
+echo ""
+echo "🔐 Passphrase:"
+check_ok "${PASSPHRASE_FILE} vorhanden (Mode $(stat -c '%a' "$PASSPHRASE_FILE"))"
+
+echo ""
+echo "🔧 Versionen:"
+local borg_version
+borg_version=$(borg --version 2>/dev/null | awk '{print $2}') || borg_version="unbekannt"
+if [[ "$borg_version" == "unbekannt" ]]; then
+  check_fail "borg nicht ausführbar"
+elif [[ "$(printf '%s\n%s\n' "$MIN_BORG_VERSION" "$borg_version" | sort -V | head -1)" \
+        != "$MIN_BORG_VERSION" ]]; then
+  check_fail "borg ${borg_version} ist älter als ${MIN_BORG_VERSION}"
+else
+  check_ok "$(borg --version)"
+fi
+check_info "$(rclone --version | head -1)"
+check_info "$(docker --version)"
+check_info "jq $(jq --version)"
+
+echo ""
+echo "☁️  Cloud-Ziele:"
+local t remote
+for t in "${BACKUP_TARGETS[@]}"; do
+  remote="${t%%:*}"
+  if rclone lsd "${remote}:" >/dev/null 2>&1; then
+    check_ok "${t}"
+  else
+    check_fail "${t} – Remote nicht erreichbar"
+  fi
+done
+
+echo ""
+if (( ERRORS == 0 )); then
+  echo "✅ Alle Checks bestanden – System bereit."
+else
+  echo "❌ ${ERRORS} Checks fehlgeschlagen – bitte beheben!"
+  exit 1
+fi
+}
+
+run_setup() {
+  require_root
+
+  local SETUP_MODE=0
+_SETUP_VARS_LOADED=1
+
+if [[ -f "$CONF_FILE" ]]; then
   echo ""
-  echo "☁️  Cloud-Ziele:"
+  echo "⚠️  Bestehende Konfiguration gefunden: ${CONF_FILE}"
+  echo ""
+  echo "Was möchtest du tun?"
+  echo "  1) Ziele ändern (Config teilweise neu einrichten)"
+  echo "  2) Scripts und Timer neu generieren (Config unverändert)"
+  echo "  3) Nur Bezeichnung für Telegram ändern"
+  echo "  4) Abbrechen"
+  local mode_choice
+  prompt_int "Auswahl (1-4): " 1 4 mode_choice
+  case "$mode_choice" in
+    1) SETUP_MODE=1 ;;
+    2) SETUP_MODE=2 ;;
+    3) SETUP_MODE=3 ;;
+    4) echo "Abgebrochen."; exit 0 ;;
+  esac
+  load_conf
+  echo ""
+  echo "   Aktuell konfigurierte Ziele:"
   local t
   for t in "${BACKUP_TARGETS[@]}"; do
     echo "   • ${t}"
   done
-
   echo ""
-  echo "📋 Letzte Backup-Logs:"
-  tail -5 "/var/log/paperless-backup.log" 2>/dev/null || echo "   keine Logs"
+  echo "🔒 Borg-Repository und Passphrase werden nicht verändert."
+fi
 
+echo "╔══════════════════════════════════════╗"
+echo "║     Paperless Backup Setup           ║"
+echo "╚══════════════════════════════════════╝"
+
+if [[ $SETUP_MODE -eq 3 ]]; then
+  set_instance_name
+  exit 0
+fi
+
+if [[ $SETUP_MODE -eq 2 ]]; then
+  cleanup_old_scripts
+  generate_scripts
+  setup_systemd
   echo ""
-  echo "🔍 Letzter Borg Check:"
-  tail -3 "/var/log/paperless-borg-check.log" 2>/dev/null || echo "   noch kein Check gelaufen"
-
-  echo ""
-  echo "🧪 Letzter Restore-Test:"
-  tail -3 "/var/log/paperless-restore-test.log" 2>/dev/null || echo "   noch kein Test gelaufen"
-}
-
-run_config_check() {
-  require_root
-  load_conf
-  check_passphrase
-  export BORG_PASSCOMMAND="cat ${PASSPHRASE_FILE}"
-
-  local ERRORS=0
-  check_ok()   { echo "   ✅ $*"; }
-  check_fail() { echo "   ❌ $*"; ERRORS=$(( ERRORS + 1 )); }
-  check_info() { echo "   ℹ️  $*"; }
-
-  echo ""
-  echo "╔══════════════════════════════════════╗"
-  echo "║     Paperless Config-Check           ║"
-  echo "╚══════════════════════════════════════╝"
-
-  echo ""
-  echo "📂 Pfade:"
-  if [[ -d "$MEDIA_DIR" ]]; then check_ok "Media-Verzeichnis: ${MEDIA_DIR}"; else check_fail "Media-Verzeichnis fehlt: ${MEDIA_DIR}"; fi
-  if [[ -d "$DATA_DIR" ]]; then check_ok "Data-Verzeichnis: ${DATA_DIR}"; else check_fail "Data-Verzeichnis fehlt: ${DATA_DIR}"; fi
-  if [[ -f "$COMPOSE_FILE" ]]; then check_ok "docker-compose.yml: ${COMPOSE_FILE}"; else check_fail "docker-compose.yml fehlt: ${COMPOSE_FILE}"; fi
-  if [[ -w "$BACKUP_TMP" ]]; then check_ok "Schreibrechte auf ${BACKUP_TMP}"; else check_fail "Keine Schreibrechte auf ${BACKUP_TMP}"; fi
-  if [[ -d "$BORG_REPO" ]]; then check_ok "Borg-Repository: ${BORG_REPO}"; else check_fail "Borg-Repository fehlt: ${BORG_REPO}"; fi
-
-  echo ""
-  echo "💾 Freier Platz:"
-  local repo_free_min avail_mb
-  repo_free_min="${BACKUP_MIN_FREE_MB:-4096}"
-  if repo_free=$(fs_free_kb "${BORG_REPO}"); then
-    avail_mb=$(( repo_free / 1024 ))
-    if (( repo_free >= repo_free_min * 1024 )); then
-      check_ok "${avail_mb} MB frei (benötigt: ${repo_free_min} MB)"
-    else
-      check_fail "${avail_mb} MB frei (benötigt: ${repo_free_min} MB)"
-    fi
-  else
-    check_fail "Freier Platz nicht ermittelbar: ${BORG_REPO}"
+  echo "✅ Scripts und Timer erfolgreich neu generiert."
+    return
   fi
 
+  setup_ask_dependencies
+  setup_ask_targets
+
+if [[ $SETUP_MODE -eq 1 ]]; then
   echo ""
-  echo "🐳 Container:"
-  if container_running "${PAPERLESS_CONTAINER}"; then
-    check_ok "Paperless-Container: ${PAPERLESS_CONTAINER}"
-  else
-    check_fail "Paperless-Container läuft nicht: ${PAPERLESS_CONTAINER}"
-  fi
-  if container_running "${DB_CONTAINER}"; then
-    check_ok "Datenbank-Container: ${DB_CONTAINER}"
-  else
-    check_fail "Datenbank-Container läuft nicht: ${DB_CONTAINER}"
-  fi
+  echo "💾 Aktualisiere ${CONF_FILE}..."
+  _check_collected_values
+  write_conf
+  echo "   ✅ Konfiguration gespeichert (chmod 600)"
+  cleanup_old_scripts
+  generate_scripts
+  setup_systemd
+  echo ""
+  echo "✅ Ziele erfolgreich geändert."
+  send_telegram "✅ Paperless Backup – Ziele geändert
+📦 Neue Ziele: $(IFS=', '; echo "${BACKUP_TARGETS[*]}")
+🖥 Host: $(hostname)
+📅 $(date '+%Y-%m-%d %H:%M')"
+  return
+fi
+
+  setup_ask_paths
+  setup_ask_telegram
+  setup_ask_rclone_options
+  setup_ask_excludes
 
   echo ""
-  echo "🔐 Passphrase:"
-  check_ok "${PASSPHRASE_FILE} vorhanden (Mode $(stat -c '%a' "$PASSPHRASE_FILE"))"
+  echo "💾 Speichere Konfiguration nach ${CONF_FILE}..."
+  _check_collected_values
+  write_conf
+  echo "   ✅ Konfiguration gespeichert (chmod 600)"
 
-  echo ""
-  echo "🔧 Versionen:"
-  local borg_version
-  borg_version=$(borg --version 2>/dev/null | awk '{print $2}') || borg_version="unbekannt"
-  if [[ "$borg_version" == "unbekannt" ]]; then
-    check_fail "borg nicht ausführbar"
-  elif [[ "$(printf '%s\n%s\n' "$MIN_BORG_VERSION" "$borg_version" | sort -V | head -1)" \
-          != "$MIN_BORG_VERSION" ]]; then
-    check_fail "borg ${borg_version} ist älter als ${MIN_BORG_VERSION}"
-  else
-    check_ok "$(borg --version)"
-  fi
-  check_info "$(rclone --version | head -1)"
-  check_info "$(docker --version)"
-  check_info "jq $(jq --version)"
+  install -d -m 700 "$BORG_REPO"
+  install -d -m 700 "$BACKUP_TMP"
+  install -d -m 700 "$RESTORE_TEST_DIR"
 
-  echo ""
-  echo "☁️  Cloud-Ziele:"
-  local t remote
-  for t in "${BACKUP_TARGETS[@]}"; do
-    remote="${t%%:*}"
-    if rclone lsd "${remote}:" >/dev/null 2>&1; then
-      check_ok "${t}"
-    else
-      check_fail "${t} – Remote nicht erreichbar"
-    fi
-  done
-
-  echo ""
-  if (( ERRORS == 0 )); then
-    echo "✅ Alle Checks bestanden – System bereit."
-  else
-    echo "❌ ${ERRORS} Checks fehlgeschlagen – bitte beheben!"
-    exit 1
-  fi
+  setup_init_borg
+  setup_finish
 }
 
 # ─────────────────────────────────────────────
@@ -2320,3 +2553,4 @@ case "$MAIN_CHOICE" in
   5) run_config_check ;;
   6) exit 0 ;;
 esac
+

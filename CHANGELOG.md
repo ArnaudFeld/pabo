@@ -3,6 +3,46 @@
 All notable changes to PABO will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [1.3.0] – 2026-09-29
+
+### Added
+- **Stiller Ausfall wird jetzt gemeldet.** Bisher hat jeder Timer nach oben
+  Erfolg gemeldet, aber nirgends nachgesehen, wann das letzte Backup war.
+  Ein toter Backup-Timer ist damit von einem guten Tag ohne Backup nicht zu
+  unterscheiden. Nach jedem erfolgreichen Backup schreibt PABO jetzt einen
+  Zeitstempel nach `/var/lib/paperless-backup/last_success`; jeder reguläre
+  Lauf – auch der Borg-Check und der Restore-Test – prüft dessen Alter und
+  meldet per Telegram, wenn er zu alt ist. Die Schwelle steht in
+  `STALE_BACKUP_DAYS` (Standard 2 Tage) und lässt sich im Setup einstellen
+  sowie von Hand in der Config anpassen. Ohne den Schlüssel gilt der
+  Standardwert, bestehende Configs funktionieren unverändert.
+- **Logrotation.** Die drei PABO-Logs wuchsen unbegrenzt; auf einem Host lag
+  das Backup-Log bereits bei 6,2 MB. Das Setup legt jetzt eine logrotate-Regel
+  unter `/etc/logrotate.d/paperless-backup` an: wöchentlich, acht
+  Generationen, komprimiert. Vorhandene Regeln werden nicht überschrieben,
+  und fehlt logrotate auf dem System, läuft alles ohne Rotation weiter.
+
+### Fixed
+- **Der Restore-Test prüft den DB-Dump jetzt wirklich.** Bisher genügten die
+  ersten fünf Zeilen und die Existenz der Datei; ein mitten im Schreiben
+  abgeschnittener Dump wäre durchgegangen. Geprüft werden jetzt Mindestgröße,
+  Zahl der SQL-Anweisungen und der Abschlussmarker `database dump complete`,
+  den ein echter `pg_dump` immer schreibt. Läuft der Datenbank-Container,
+  wird der Dump zusätzlich mit `psql` auf lesbare Syntax geprüft.
+- **Die Dateisystem-Warnung greift auch bei BIND-Mounts und LVM.** Der
+  Vergleich lief über `df --output=source`, das bei einem BIND-Mount das
+  Datenverzeichnis als anderes Gerät meldet, obwohl der Speicher derselbe
+  ist – der Hinweis auf ein Repo auf derselben Platte blieb also aus. PABO
+  löst den Mountpunkt jetzt über `findmnt` auf und fällt auf `df` zurück.
+
+### Changed
+- **`run_setup()` aufgeteilt.** Die 397 Zeilen sind jetzt neun Funktionen:
+  `setup_ask_dependencies`, `setup_ask_targets`, `setup_ask_paths`,
+  `setup_ask_telegram`, `setup_ask_rclone_options`, `setup_ask_excludes`,
+  `setup_init_borg` und `setup_finish`. `run_setup()` hat 91 Zeilen und zeigt
+  den Ablauf. Das Verhalten ist unverändert; ein Befehlsvergleich vor und
+  nach dem Umbau ergibt keine verlorenen Zeilen.
+
 ## [1.2.1] – 2026-09-29
 
 ### Added

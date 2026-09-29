@@ -178,6 +178,27 @@ Without `INSTANCE_NAME`, PABO derives the label itself from hostname and IP addr
 
 `INSTANCE_NAME` is free text up to 40 characters; quotes, backslash, `$`, and backtick are not allowed. Leaving it empty is explicitly fine and switches on the automatic fallback.
 
+### When was the last backup?
+
+A backup that does not run produces no error – which makes it look exactly like a good day without a backup. To keep that from going unnoticed, PABO writes a timestamp after every successful run and checks its age on every scheduled run:
+
+```
+❌ No successful backup for 3 days
+📅 Last backup 3 days ago
+⏳ Expected: at least every 2 days
+🔎 Reason: check the backup timer (systemctl list-timers | grep paperless)
+```
+
+The threshold is `STALE_BACKUP_DAYS`, 2 days by default, set in the setup and editable in the config. When it is exceeded, the Borg check or the restore test sends the message – not just the backup, because a dead timer would otherwise never reach a call.
+
+The timestamp lives in `/var/lib/paperless-backup/last_success` and is only written on real success, never in a dry run.
+
+This does not replace external monitoring: if the host goes down completely, this check stays silent too. A recurring reminder on your phone or a push from outside is the addition, not the replacement.
+
+### Logs rotate themselves
+
+Without rotation the backup log grows without limit; on one host it had already reached 6.2 MB. The setup therefore writes a rule to `/etc/logrotate.d/paperless-backup`: weekly, eight generations, compressed. Existing rules are left alone, and if `logrotate` is not installed everything keeps working, just without rotation.
+
 On an existing host you can change the name afterwards without running through the setup questions again:
 
 ```bash
@@ -280,6 +301,7 @@ RCLONE_TRANSFERS="4"
 RCLONE_CHECKERS="8"
 RCLONE_MAX_DELETE="500"                    # Safety net for rclone sync
 BACKUP_MIN_FREE_MB="4096"                  # Minimum free space in MB, otherwise abort
+STALE_BACKUP_DAYS="2"                     # Warn if no backup ran for this many days
 
 BORG_EXCLUDES=(
   "/data/paperless/data/log"

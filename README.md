@@ -178,6 +178,27 @@ Ohne `INSTANCE_NAME` ermittelt PABO die Kennung selbst, nämlich Hostname und IP
 
 `INSTANCE_NAME` ist Freitext bis 40 Zeichen; Quotes, Backslash, `$` und Backtick sind nicht erlaubt. Leer ist ausdrücklich erlaubt und schaltet den automatischen Fallback frei.
 
+### Wann war das letzte Backup?
+
+Ein Backup, das nicht läuft, erzeugt keine Fehlermeldung – und sieht damit genauso aus wie ein guter Tag ohne Backup. Damit das nicht unbemerkt bleibt, schreibt PABO nach jedem erfolgreichen Lauf einen Zeitstempel und prüft bei jedem regulären Lauf, wie alt er ist:
+
+```
+❌ Kein erfolgreiches Backup seit 3 Tagen
+📅 Letztes Backup vor 3 Tagen
+⏳ Erwartet: mindestens alle 2 Tage
+🔎 Grund: prüfe den Backup-Timer (systemctl list-timers | grep paperless)
+```
+
+Die Schwelle steht in `STALE_BACKUP_DAYS`, Standard ist 2 Tage, im Setup einstellbar und von Hand in der Config änderbar. Wird sie überschritten, verschickt der Borg-Check oder der Restore-Test die Meldung – nicht nur das Backup, denn ein toter Timer erreicht sonst keinen Aufruf.
+
+Der Zeitstempel liegt unter `/var/lib/paperless-backup/last_success` und wird nur bei echtem Erfolg geschrieben, nicht im Dry-Run.
+
+Das ersetzt keine externe Überwachung: Fällt der Host komplett aus, schweigt auch dieser Check. Ein Wecker auf dem Handy oder eine Push-Meldung von außen ist die Ergänzung, nicht der Ersatz.
+
+### Logs rotieren sich selbst
+
+Das Backup-Log wächst ohne Rotation unbegrenzt, auf einem Host lag es bereits bei 6,2 MB. Das Setup legt deshalb eine Regel unter `/etc/logrotate.d/paperless-backup` an: wöchentlich, acht Generationen, komprimiert. Vorhandene Regeln bleiben unangetastet, und ohne installiertes `logrotate` läuft alles unverändert weiter.
+
 Auf einem Bestandshost lässt sich der Name nachträglich ändern, ohne die Setup-Fragen erneut zu durchlaufen:
 
 ```bash
@@ -280,6 +301,7 @@ RCLONE_TRANSFERS="4"
 RCLONE_CHECKERS="8"
 RCLONE_MAX_DELETE="500"                    # Sicherheitsnetz für rclone sync
 BACKUP_MIN_FREE_MB="4096"                  # Mindestfreiraum in MB, sonst Abbruch
+STALE_BACKUP_DAYS="2"                     # Warnung, wenn so lange kein Backup lief
 
 BORG_EXCLUDES=(
   "/data/paperless/data/log"
