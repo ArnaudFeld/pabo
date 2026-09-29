@@ -618,7 +618,8 @@ require_free_space() {
     log "❌ Platzprüfung: nur $(( free / 1024 )) MB frei unter ${path} (Mindestwert BACKUP_MIN_FREE_MB: ${need_mb} MB) – ${context} abgebrochen"
     send_telegram "❌ ${context} abgebrochen
 ⚠️ Nur $(( free / 1024 )) MB frei unter ${path} (benötigt: ${need_mb} MB)
-ℹ️ Platte aufräumen oder BACKUP_MIN_FREE_MB in /etc/paperless-backup.conf anpassen"
+ℹ️ Platte aufräumen oder BACKUP_MIN_FREE_MB in /etc/paperless-backup.conf anpassen
+📋 Log: cat ${LOG_FILE}"
     exit "$exit_code"
   fi
   return 0
@@ -654,7 +655,8 @@ create_archive() {
     log "   Namen prüfen mit: docker ps -a --format '{{.Names}}\t{{.Status}}'"
     send_telegram "❌ Backup abgebrochen
 🔴 Paperless-Container '${PAPERLESS_CONTAINER}' läuft nicht
-ℹ️ PAPERLESS_CONTAINER in /etc/paperless-backup.conf prüfen"
+ℹ️ PAPERLESS_CONTAINER in /etc/paperless-backup.conf prüfen
+📋 Log: cat ${LOG_FILE}"
     exit "$EXIT_DB"
   fi
 
@@ -663,7 +665,8 @@ create_archive() {
     log "   Namen prüfen mit: docker ps -a --format '{{.Names}}\t{{.Status}}'"
     send_telegram "❌ Backup abgebrochen
 🔴 Datenbank-Container '${DB_CONTAINER}' läuft nicht
-ℹ️ DB_CONTAINER in /etc/paperless-backup.conf prüfen"
+ℹ️ DB_CONTAINER in /etc/paperless-backup.conf prüfen
+📋 Log: cat ${LOG_FILE}"
     exit "$EXIT_DB"
   fi
 
@@ -675,7 +678,8 @@ create_archive() {
     else
       log "[EXPORTER] ⚠️  document_exporter fehlgeschlagen – Backup läuft weiter"
       send_telegram "⚠️ document_exporter Warnung
-❌ Export fehlgeschlagen – Backup läuft ohne aktuellen Export weiter."
+❌ Export fehlgeschlagen – Backup läuft ohne aktuellen Export weiter.
+📋 Log: cat ${LOG_FILE}"
     fi
   fi
 
@@ -701,7 +705,8 @@ create_archive() {
       rm -f "${db_dump}"
       send_telegram "❌ Backup fehlgeschlagen
 🔴 Fehler: [DB] PostgreSQL-Dump
-🔢 Exit-Code: ${EXIT_DB}"
+🔢 Exit-Code: ${EXIT_DB}
+📋 Log: cat ${LOG_FILE}"
       exit "$EXIT_DB"
     fi
   fi
@@ -742,7 +747,8 @@ create_archive() {
     send_telegram "❌ Backup fehlgeschlagen
 🔴 Fehler: [BORG] borg create
 🗄 Archiv: ${archive}
-🔢 Exit-Code: ${EXIT_BORG}"
+🔢 Exit-Code: ${EXIT_BORG}
+📋 Log: cat ${LOG_FILE}"
     exit "$EXIT_BORG"
   fi
   log "[BORG] ✅ Archiv ${archive} erstellt"
@@ -764,7 +770,8 @@ create_archive() {
     if ! borg compact "${BORG_REPO}" 2>&1 | tee -a "$LOG_FILE"; then
       log "[BORG] ⚠️  Compact fehlgeschlagen – nicht kritisch"
       send_telegram "⚠️ Borg Compact Warnung
-Compact nach Prune fehlgeschlagen. Backup war erfolgreich."
+Compact nach Prune fehlgeschlagen. Backup war erfolgreich.
+📋 Log: cat ${LOG_FILE}"
     fi
   fi
 
@@ -786,7 +793,8 @@ upload_to_target() {
     send_telegram "❌ Upload abgebrochen
 ☁️ Ziel: ${target}
 🔴 Grund: lokales Borg-Repository ist leer oder ungültig
-🛡 Schutz: es wurde nichts in der Cloud gelöscht"
+🛡 Schutz: es wurde nichts in der Cloud gelöscht
+📋 Log: cat ${LOG_FILE}"
     return 1
   fi
 
@@ -808,7 +816,8 @@ upload_to_target() {
   send_telegram "❌ Backup-Upload fehlgeschlagen
 🔴 Fehler: [RCLONE] Upload
 ☁️ Ziel: ${target}
-🔢 Exit-Code: ${EXIT_RCLONE}"
+🔢 Exit-Code: ${EXIT_RCLONE}
+📋 Log: cat ${LOG_FILE}"
   return 1
 }
 
@@ -820,7 +829,8 @@ run_backup() {
     flock -n 9 || {
       log "⚠️  Backup läuft bereits (Lock aktiv). Abbruch."
       send_telegram "⚠️ Backup übersprungen
-🔒 Ein anderer Backup-Prozess läuft bereits."
+🔒 Ein anderer Backup-Prozess läuft bereits.
+📋 Log: cat ${LOG_FILE}"
       exit 0
     }
 
@@ -851,7 +861,8 @@ run_backup() {
 🗄 Archiv: ${ARCHIVE_NAME_CREATED}
 ⚠️ Upload fehlgeschlagen für: ${failed[*]}
 💾 Repo-Größe: ${size}
-⏱ Dauer: ${duration}s"
+⏱ Dauer: ${duration}s
+📋 Log: cat ${LOG_FILE}"
       exit "$EXIT_RCLONE"
     fi
 
