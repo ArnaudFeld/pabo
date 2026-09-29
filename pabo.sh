@@ -893,7 +893,6 @@ upload_to_target() {
 run_backup() {
   local dry_run="${1:-false}"
   ensure_lock_dir
-  log "ℹ️  Host-Kennung: $(pabo_identity)"
 
   (
     flock -n 9 || {
@@ -973,7 +972,6 @@ run_upload_only() {
 
 run_borg_check() {
   ensure_lock_dir
-  log "ℹ️  Host-Kennung: $(pabo_identity)"
   (
     flock -n 9 || {
       log "⚠️  Borg Check läuft bereits. Abbruch."
@@ -1015,7 +1013,6 @@ run_borg_check() {
 
 run_restore_test() {
   ensure_lock_dir
-  log "ℹ️  Host-Kennung: $(pabo_identity)"
   (
     flock -n 9 || {
       log "⚠️  Restore-Test läuft bereits. Abbruch."
@@ -1645,6 +1642,7 @@ source ${LIB_FILE}
 ${log_line}
 load_conf
 require_root
+log "ℹ️  Host-Kennung: \$(pabo_identity)"
 ${entry}
 EOF
   chmod 755 "$path"
