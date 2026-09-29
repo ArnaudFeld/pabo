@@ -3,6 +3,20 @@
 All notable changes to PABO will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [1.1.1] – 2026-09-29
+
+### Fixed
+- **Update from 1.0.5 failed on every installation with default excludes.**
+  The 1.0.5 setup wrote array entries with `printf %q`, which escapes glob
+  metacharacters: `*.tmp` landed in the config as `\*.tmp`. The 1.1.0 parser
+  rejects backslashes, so every upgrade aborted with
+  `BORG_EXCLUDES enthält ungültigen Eintrag: '\*.tmp'`. Array values
+  containing a backslash are now unescaped on read and then validated as
+  usual; the next config write stores them unescaped. A new configuration can
+  never contain a backslash, so legacy entries are recognized unambiguously,
+  and the decoded value still has to pass validation – `$(`, `;`, `&`, `|`
+  and quotes remain rejected.
+
 ## [1.1.0] – 2026-09-11
 
 ### Security

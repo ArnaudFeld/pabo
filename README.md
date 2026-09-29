@@ -89,7 +89,7 @@ cd /opt/pabo && git pull
 2. Setup starten und Modus 2 wählen (Scripts und Timer neu generieren). Das entfernt die alten Skripte und Timer pro Ziel und legt die neue Struktur an; Konfiguration, Borg-Repository und Passphrase bleiben unangetastet.
 3. Mit `config-check` prüfen. Zwei neue Schlüssel bekommen automatisch Standardwerte (`RCLONE_MAX_DELETE=500`, `BACKUP_MIN_FREE_MB=4096`); wer davon abweichen will, trägt sie in `/etc/paperless-backup.conf` ein oder richtet die Ziele über Modus 1 neu ein.
 
-Vier Verhaltensänderungen betreffen bestehende Installationen. Die Prüfung ist strenger als früher: Pfade mit Leerzeichen, `..` oder doppelten Schrägstrichen sowie ein Bot-Token ohne `<id>:<token>`-Form brechen den Lauf jetzt ab. Exit-Code 10 meldet zusätzlich Abbrüche wegen fehlender Container oder zu wenig freiem Platz. Es gibt nur noch einen Backup-Timer für alle Ziele statt einem Timer pro Ziel. Nach einem Restore fragt das Skript, ob das heruntergeladene Repository in `/backup/restore-repo` gelöscht werden soll.
+Vier Verhaltensänderungen betreffen bestehende Installationen. Die Prüfung ist strenger als früher: Pfade mit Leerzeichen, `..` oder doppelten Schrägstrichen sowie ein Bot-Token ohne `<id>:<token>`-Form brechen den Lauf jetzt ab. Maskierte Glob-Muster aus alten Configs (`\*.tmp`) werden beim Einlesen aufgelöst, das funktioniert also ohne Handgriff. Exit-Code 10 meldet zusätzlich Abbrüche wegen fehlender Container oder zu wenig freiem Platz. Es gibt nur noch einen Backup-Timer für alle Ziele statt einem Timer pro Ziel. Nach einem Restore fragt das Skript, ob das heruntergeladene Repository in `/backup/restore-repo` gelöscht werden soll.
 
 ## Ersteinrichtung
 

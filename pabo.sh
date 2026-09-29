@@ -240,8 +240,31 @@ _conf_scalar() {
   esac
 }
 
+# Löst die Maskierung auf, die printf %q erzeugt hat: \X wird zu X.
+# Konfigurationen aus 1.0.5 und älter enthalten so escaped Globs wie \*.tmp.
+_conf_unescape_q() {
+  local v="$1" out="" i ch
+  for (( i = 0; i < ${#v}; i++ )); do
+    ch="${v:i:1}"
+    if [[ "$ch" == "\\" && $(( i + 1 )) -lt ${#v} ]]; then
+      i=$(( i + 1 ))
+      out+="${v:i:1}"
+    else
+      out+="$ch"
+    fi
+  done
+  printf '%s' "$out"
+}
+
 _conf_array_elem() {
   local key="$1" val="$2"
+  # Enthält der Wert einen Backslash, stammt er aus einer alten Config, die
+  # Array-Einträge mit printf %q geschrieben hat. Ein neuer Wert kann keinen
+  # Backslash enthalten (_conf_embeddable verbietet ihn), die Unterscheidung
+  # ist damit eindeutig. Nach dem Auflösen wird der Wert normal validiert.
+  if [[ "$val" == *\\* ]]; then
+    val="$(_conf_unescape_q "$val")"
+  fi
   case "$key" in
     BACKUP_TARGETS)
       if valid_target "$val"; then

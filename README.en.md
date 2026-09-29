@@ -89,7 +89,7 @@ cd /opt/pabo && git pull
 2. Start setup and pick mode 2 (regenerate scripts and timers). It removes the old per-target scripts and timers and creates the new layout; configuration, Borg repository and passphrase stay untouched.
 3. Run `config-check`. Two new keys get automatic defaults (`RCLONE_MAX_DELETE=500`, `BACKUP_MIN_FREE_MB=4096`); to change them, edit `/etc/paperless-backup.conf` or re-run target setup via mode 1.
 
-Four behavior changes affect existing installations. Validation is stricter than before: paths with spaces, `..` or double slashes, and a bot token that does not look like `<id>:<token>`, abort the run now. Exit code 10 additionally reports aborts from missing containers or low disk space. There is only one backup timer for all targets instead of one timer per target. After a restore, the script asks whether to delete the downloaded repository in `/backup/restore-repo`.
+Four behavior changes affect existing installations. Validation is stricter than before: paths with spaces, `..` or double slashes, and a bot token that does not look like `<id>:<token>`, abort the run now. Escaped glob patterns from older configs (`\*.tmp`) are unescaped while reading, so those work without manual changes. Exit code 10 additionally reports aborts from missing containers or low disk space. There is only one backup timer for all targets instead of one timer per target. After a restore, the script asks whether to delete the downloaded repository in `/backup/restore-repo`.
 
 ## Initial setup
 
