@@ -106,7 +106,7 @@ Der Assistent fragt der Reihe nach ab:
 4. Docker-Container erkennen (Paperless und PostgreSQL)
 5. Pfade bestätigen (Media, Data, Export, Compose-Datei)
 6. Warnung, falls Borg-Repo und Daten auf demselben Laufwerk liegen
-7. Telegram konfigurieren (Bot-Token und Chat-ID)
+7. Telegram konfigurieren (Bot-Token, Chat-ID und optionale Bezeichnung für die Meldungen)
 8. rclone-Optionen (Bandbreitenlimit, Transfers, Checker, Lösch-Limit, Mindestfreiraum)
 9. Borg-Excludes (Logs, NLTK-Daten, temporäre Dateien)
 10. Borg-Repository initialisieren (AES-256)
@@ -164,6 +164,19 @@ Das Menü bietet setup (Einrichtung oder Ziele ändern), restore (interaktiver A
 Das Untermenü von test enthält ein echtes Backup, einen Dry-Run, einen reinen Upload in ein einzelnes Ziel, den Borg-Check und den Restore Dry-Run Test.
 
 Bei vorhandener `/etc/paperless-backup.conf` hat setup zwei Modi: Modus 1 ändert nur die Cloud-Ziele und lässt Borg-Repo und Passphrase unverändert; Modus 2 erzeugt Scripts und Timer neu und fasst die Config nicht an.
+
+### Welcher Host schreibt?
+
+Läuft PABO auf mehreren Maschinen, landen alle Meldungen im selben Chat. Damit daraus nicht ein Rätsel wird, steht über jeder Meldung der Absender:
+
+```
+🏠 Privat
+✅ Backup fertig – 1284 Dateien in 3m 20s
+```
+
+Ohne `INSTANCE_NAME` ermittelt PABO die Kennung selbst, nämlich Hostname und IP-Adresse (`paperless-ngx (10.10.10.108)`). Die IP wird bevorzugt aus der Route des ausgehenden Verkehrs gelesen, Loopback-Adressen werden übergangen. Dieselbe Kennung steht einmal pro Lauf im Log.
+
+`INSTANCE_NAME` ist Freitext bis 40 Zeichen; Quotes, Backslash, `$` und Backtick sind nicht erlaubt. Leer ist ausdrücklich erlaubt und schaltet den automatischen Fallback frei. Nach dem Ändern Scripts und Timer neu erzeugen.
 
 Ein rotiertes Telegram-Token gehört von Hand in die Config; danach Scripts und Timer neu erzeugen:
 
@@ -247,6 +260,7 @@ BACKUP_TMP="/backup/paperless-tmp"          # Temporär für DB-Dump
 # Bei Token-Rotation: setup → Modus 2 (neu generieren)
 TELEGRAM_TOKEN="123456:ABC..."
 TELEGRAM_CHAT_ID="987654321"
+INSTANCE_NAME="Privat"                      # Kennzeichnung in Telegram, leer = automatisch aus Hostname + IP
 
 BACKUP_TARGETS=(
   onedrive:/Paperless-Borg-Encrypted        # Format: remote:/pfad

@@ -106,7 +106,7 @@ The wizard asks for input in this order:
 4. Detect Docker containers (Paperless and PostgreSQL)
 5. Confirm paths (media, data, export, compose file)
 6. Warn if Borg repo and data sit on the same disk
-7. Configure Telegram (bot token and chat ID)
+7. Configure Telegram (bot token, chat ID, and an optional label for the messages)
 8. rclone options (bandwidth limit, transfers, checkers, delete limit, minimum free space)
 9. Borg excludes (logs, NLTK data, temp files)
 10. Initialize Borg repository (AES-256)
@@ -164,6 +164,19 @@ The menu offers setup (first setup or change targets), restore (interactive wiza
 The test submenu holds a real backup, a dry-run, a plain upload to a single target, the Borg check and the restore dry-run test.
 
 With an existing `/etc/paperless-backup.conf`, setup has two modes: mode 1 changes only the cloud targets and leaves Borg repo and passphrase alone; mode 2 regenerates scripts and timers and does not touch the config.
+
+### Which host sent this?
+
+When PABO runs on several machines, every message ends up in the same chat. To keep that from turning into a guessing game, each message names its sender:
+
+```
+🏠 Private
+✅ Backup done – 1284 files in 3m 20s
+```
+
+Without `INSTANCE_NAME`, PABO derives the label itself from hostname and IP address (`paperless-ngx (10.10.10.108)`). The IP is taken from the route of outbound traffic where possible, and loopback addresses are skipped. The same label appears once per run in the log.
+
+`INSTANCE_NAME` is free text up to 40 characters; quotes, backslash, `$`, and backtick are not allowed. Leaving it empty is explicitly fine and switches on the automatic fallback. Regenerate scripts and timers after changing it.
 
 A rotated Telegram token goes into the config by hand; then regenerate scripts and timers:
 
@@ -247,6 +260,7 @@ BACKUP_TMP="/backup/paperless-tmp"          # Temporary storage for DB dump
 # For token rotation: run setup → Mode 2 (regenerate)
 TELEGRAM_TOKEN="123456:ABC..."
 TELEGRAM_CHAT_ID="987654321"
+INSTANCE_NAME="Private"                      # Kennzeichnung in Telegram, leer = derived from hostname + IP automatically
 
 BACKUP_TARGETS=(
   gdrive:/Paperless-Borg-Encrypted          # Format: remote:/path

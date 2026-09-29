@@ -3,6 +3,27 @@
 All notable changes to PABO will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [1.2.0] – 2026-09-29
+
+### Added
+- **Telegram-Meldungen sagen jetzt, von welchem Host sie kommen.** Läuft
+  PABO auf mehreren Maschinen, landen alle Meldungen im selben Chat und
+  waren nicht zuordenbar. Jede Meldung beginnt jetzt mit dem Absender, und
+  dieselbe Kennung steht einmal pro Lauf im Log:
+
+  ```
+  🏠 Privat
+  ✅ Backup fertig – 1284 Dateien in 3m 20s
+  ```
+
+  Im Setup kommt eine optionale Frage nach der Bezeichnung. Ohne
+  `INSTANCE_NAME` ermittelt PABO die Kennung selbst aus Hostname und
+  IP-Adresse (`paperless-ngx (10.10.10.108)`); die IP wird bevorzugt aus
+  der Route des ausgehenden Verkehrs gelesen, Loopback-Adressen werden
+  übersprungen. Für bestehende Configs ändert sich nichts, der Fallback
+  greift ohne Eingriff. `INSTANCE_NAME` ist Freitext bis 40 Zeichen und
+  lässt Quotes, Backslash, `$` und Backtick nicht zu.
+
 ## [1.1.1] – 2026-09-29
 
 ### Fixed

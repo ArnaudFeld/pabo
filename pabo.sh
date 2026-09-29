@@ -1,5 +1,5 @@
 #!/bin/bash
-# pabo.sh – PABO: Paperless-Borg Backup Orchestrator v1.1.1
+# pabo.sh – PABO: Paperless-Borg Backup Orchestrator v1.2.0
 # Automated, encrypted, multi-cloud backups for Paperless-ngx
 # powered by BorgBackup and rclone.
 # https://github.com/ArnaudFeld/pabo
@@ -19,7 +19,7 @@ umask 077
 # ═════════════════════════════════════════════
 # >>> PABO COMMON BEGIN
 
-PABO_VERSION="1.1.1"
+PABO_VERSION="1.2.0"
 
 CONF_FILE="/etc/paperless-backup.conf"
 PASSPHRASE_FILE="/root/.borg_passphrase"
@@ -95,6 +95,15 @@ valid_name()  { [[ "$1" =~ ^[A-Za-z0-9_.-]+$ ]]; }
 valid_int()   { [[ "$1" =~ ^[0-9]+$ ]]; }
 valid_bool()  { [[ "$1" == "true" || "$1" == "false" ]]; }
 valid_token() { [[ "$1" =~ ^[0-9]{6,}:[A-Za-z0-9_-]{20,}$ ]]; }
+# Freitext fuer die Host-Kennzeichnung. Leer ist erlaubt, dann greift der
+# automatische Fallback. Quotes, Backslash, $ und Backtick sind verboten,
+# damit der Wert die Bash-Datei nicht aushebeln kann.
+valid_label() {
+  local v="$1" re="^[^'\"\\\\$\`]+$"
+  [[ -n "$v" ]] || return 0
+  [[ ${#v} -le 40 ]] || return 1
+  [[ "$v" =~ $re ]]
+}
 valid_chatid(){ [[ "$1" =~ ^-?[0-9]+$ ]]; }
 valid_target() {
   local re='^[A-Za-z0-9_-]+:[A-Za-z0-9/_. -]+$'
@@ -206,6 +215,13 @@ _conf_scalar() {
         conf_error "TELEGRAM_TOKEN hat nicht das erwartete Format '<id>:<token>'"
       fi
       ;;
+    INSTANCE_NAME)
+      if valid_label "$val"; then
+        printf -v "$key" '%s' "$val"
+      else
+        conf_error "INSTANCE_NAME enthält unzulässige Zeichen oder ist zu lang (max. 40): '${val}'"
+      fi
+      ;;
     TELEGRAM_CHAT_ID)
       if valid_chatid "$val"; then
         printf -v "$key" '%s' "$val"
@@ -293,7 +309,7 @@ parse_conf() {
   PAPERLESS_CONTAINER=""; DB_CONTAINER=""; COMPOSE_FILE=""
   DB_NAME=""; DB_USER=""
   MEDIA_DIR=""; DATA_DIR=""; EXPORT_DIR=""; BORG_REPO=""; BACKUP_TMP=""
-  TELEGRAM_TOKEN=""; TELEGRAM_CHAT_ID=""
+  TELEGRAM_TOKEN=""; TELEGRAM_CHAT_ID=""; INSTANCE_NAME=""
   RCLONE_BWLIMIT=""; RCLONE_TRANSFERS=""; RCLONE_CHECKERS=""; RCLONE_MAX_DELETE=""; BACKUP_MIN_FREE_MB=""
   ENABLE_DOCUMENT_EXPORTER="false"; EXPORTER_DEST=""
   BACKUP_TARGETS=(); BORG_EXCLUDES=()
@@ -467,6 +483,7 @@ write_conf() {
     printf '\n'
     _conf_emit TELEGRAM_TOKEN   "${TELEGRAM_TOKEN}"
     _conf_emit TELEGRAM_CHAT_ID "${TELEGRAM_CHAT_ID}"
+    _conf_emit INSTANCE_NAME    "${INSTANCE_NAME}"
     printf '\n'
 
     printf 'BACKUP_TARGETS=(\n'
@@ -533,9 +550,38 @@ check_restore_space() {
 # Fehler beim Senden beenden nie ein laufendes Backup.
 # ─────────────────────────────────────────────
 
+pabo_identity() {
+  local h="" ip=""
+  if [[ -n "${INSTANCE_NAME:-}" ]]; then
+    printf '%s' "${INSTANCE_NAME}"
+    return 0
+  fi
+  h="$(hostname 2>/dev/null || true)"
+  [[ -n "$h" ]] || h="$(cat /etc/hostname 2>/dev/null || true)"
+  # Bevorzugt die Quell-IP des ausgehenden Verkehrs. hostname -I listet alle
+  # Adressen, wobei Loopback zuerst steht - deshalb 127./169.254. aussortieren.
+  ip="$(ip route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)"
+  if [[ -z "$ip" ]]; then
+    ip="$(hostname -I 2>/dev/null | tr ' ' '\n' \
+            | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' \
+            | grep -v -E '^(127\.|169\.254\.|0\.)' \
+            | head -1 || true)"
+  fi
+  if [[ -n "$h" && -n "$ip" ]]; then
+    printf '%s (%s)' "$h" "$ip"
+  elif [[ -n "$h" ]]; then
+    printf '%s' "$h"
+  else
+    printf '%s' "unbekannter Host"
+  fi
+}
+
 send_telegram() {
   local message="$1"
-  local payload http_code cfg
+  local payload http_code cfg identity
+
+  identity="$(pabo_identity)"
+  message="🏠 ${identity}"$'\n'"${message}"
 
   payload=$(jq -n \
     --arg cid  "${TELEGRAM_CHAT_ID}" \
@@ -847,6 +893,7 @@ upload_to_target() {
 run_backup() {
   local dry_run="${1:-false}"
   ensure_lock_dir
+  log "ℹ️  Host-Kennung: $(pabo_identity)"
 
   (
     flock -n 9 || {
@@ -926,6 +973,7 @@ run_upload_only() {
 
 run_borg_check() {
   ensure_lock_dir
+  log "ℹ️  Host-Kennung: $(pabo_identity)"
   (
     flock -n 9 || {
       log "⚠️  Borg Check läuft bereits. Abbruch."
@@ -967,6 +1015,7 @@ run_borg_check() {
 
 run_restore_test() {
   ensure_lock_dir
+  log "ℹ️  Host-Kennung: $(pabo_identity)"
   (
     flock -n 9 || {
       log "⚠️  Restore-Test läuft bereits. Abbruch."
@@ -1400,6 +1449,16 @@ run_setup() {
     fi
     echo "   ❌ Ungültig – bitte eine Ganzzahl eingeben"
   done
+  read -rp "   Bezeichnung für Telegram-Meldungen (leer = Hostname + IP): " INSTANCE_NAME
+  if ! valid_label "$INSTANCE_NAME"; then
+    echo "   ❌ Unzulässige Zeichen in der Bezeichnung – es wird der automatische Name verwendet"
+    INSTANCE_NAME=""
+  elif [[ -n "$INSTANCE_NAME" ]]; then
+    echo "   ℹ️  Meldungen werden mit '${INSTANCE_NAME}' gekennzeichnet"
+  else
+    INSTANCE_NAME=""
+    echo "   ℹ️  Es wird automatisch Hostname + IP verwendet"
+  fi
 
   echo ""
   echo "☁️  rclone Upload-Optionen"
