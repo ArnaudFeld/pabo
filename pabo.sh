@@ -788,6 +788,9 @@ setup_logrotate_config() {
     delaycompress
     missingok
     notifempty
+    # /var/log gehoert auf Ubuntu:root:syslog 1755 und ist damit nicht
+    # world-writable - logrotate verlangt hier aber ausdruecklich ein su.
+    su root root
     create 600 root root
 }
 EOF
