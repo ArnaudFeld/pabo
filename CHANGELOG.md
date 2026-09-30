@@ -3,6 +3,28 @@
 All notable changes to PABO will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [1.3.1] – 2026-09-30
+
+### Fixed
+- **Die gemeldete Dump-Größe war falsch.** `du -h` zählt belegte Blöcke
+  statt der Dateigröße. Auf ZFS bedeutet das: eine leere Datei, eine
+  100-kB-Datei und ein 73-MB-Dump melden in der ersten Zeile des Logs
+  alle drei `512`. Dadurch sah `[DB] ✅ Dump OK (512)` aus, während der
+  Dump tatsächlich 73 MB groß war – die Angabe war wertlos und beim
+  Verteilen des Problems irreführend. Alle fünf `du`-Aufrufe gehen jetzt
+  über `human_size`, das `--apparent-size` nutzt und auf Systemen ohne
+  GNU-coreutils auf `wc -c` zurückfällt.
+- **`pg_dump` mit Rückgabewert 0 und leerem Ergebnis werden abgewiesen.**
+  Bisher genügte der Rückgabewert von `pg_dump`. Jetzt prüft PABO den
+  erzeugten Dump zusätzlich auf Mindestgröße, Zahl der
+  `CREATE`/`COPY`-Anweisungen und den Abschlussmarker
+  `database dump complete`, den ein echter `pg_dump` immer schreibt. Ein
+  Dump, der faktisch leer ist, gilt damit als Fehler und nicht als Erfolg –
+  die Meldung nennt den konkreten Grund.
+- **`grep -c` konnte eine zweizeilige Zahl liefern** und damit die
+  Arithmetik in der Dump-Prüfung sprengen. Die Auswertung ist jetzt
+  normalisiert.
+
 ## [1.3.0] – 2026-09-29
 
 ### Added

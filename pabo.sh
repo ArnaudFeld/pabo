@@ -1,5 +1,5 @@
 #!/bin/bash
-# pabo.sh – PABO: Paperless-Borg Backup Orchestrator v1.3.0
+# pabo.sh – PABO: Paperless-Borg Backup Orchestrator v1.3.1
 # Automated, encrypted, multi-cloud backups for Paperless-ngx
 # powered by BorgBackup and rclone.
 # https://github.com/ArnaudFeld/pabo
@@ -19,7 +19,7 @@ umask 077
 # ═════════════════════════════════════════════
 # >>> PABO COMMON BEGIN
 
-PABO_VERSION="1.3.0"
+PABO_VERSION="1.3.1"
 
 CONF_FILE="/etc/paperless-backup.conf"
 PASSPHRASE_FILE="/root/.borg_passphrase"
@@ -714,19 +714,41 @@ fs_mount_source() {
 # abgeschnittener Dump mit intaktem Kopf waere so durchgegangen. Jetzt:
 # Mindestgroesse, vollstaendiger SQL-Inhalt, und wenn moeglich eine echte
 # Syntaxpruefung im laufenden DB-Container.
+# Echte Dateigroesse formatiert. du -h zaehlt belegte Bloecke und meldet auf
+# ZFS fuer jede kleine Datei "512", unabhaengig vom Inhalt - deshalb
+# --apparent-size. BSD-du (macOS) kennt die Option nicht, dort greift wc.
+human_size() {
+  local path="$1" out=""
+  if [[ ! -e "$path" ]]; then printf '0'; return 0; fi
+  out=$(du -h --apparent-size "$path" 2>/dev/null | cut -f1)
+  if [[ -z "$out" || "$out" == *[!0-9A-Za-z.,]* ]]; then
+    local b
+    b=$(wc -c < "$path" 2>/dev/null || echo 0)
+    b="${b//[[:space:]]/}"
+    if   (( b >= 1073741824 )); then printf '%s.%sG' "$(( b / 1073741824 ))" "$(( (b % 1073741824) * 10 / 1073741824 ))"
+    elif (( b >= 1048576 ));    then printf '%sM' "$(( b / 1048576 ))"
+    elif (( b >= 1024 ));       then printf '%sK' "$(( b / 1024 ))"
+    else printf '%s' "$b"; fi
+    return 0
+  fi
+  printf '%s' "$out"
+}
+
 validate_db_dump() {
   local dump="$1" size_bytes="" tables=0 size_h=""
   [[ -f "$dump" ]] || { printf 'Datei fehlt'; return 1; }
 
-  size_bytes=$(wc -c < "$dump" 2>/dev/null || echo 0)
-  size_bytes="${size_bytes//[[:space:]]/}"
+  size_bytes=$(wc -c < "$dump" 2>/dev/null | tr -d '[:space:]')
+  [[ "$size_bytes" =~ ^[0-9]+$ ]] || size_bytes=0
   if (( size_bytes < 100 )); then
     printf 'Dump ist mit %s Byte zu klein für einen PostgreSQL-Dump' "$size_bytes"
     return 1
   fi
 
-  # SQL-Inhalt: ohne diese Befehle ist es kein brauchbarer Dump
-  tables=$(grep -c -E '^(CREATE|COPY) ' "$dump" 2>/dev/null || echo 0)
+  # SQL-Inhalt: ohne diese Befehle ist es kein brauchbarer Dump.
+  # grep -c kann bei einem Fehlschlag mehrzeilig werden, deshalb normalisieren.
+  tables=$(grep -c -E '^(CREATE|COPY) ' "$dump" 2>/dev/null | head -1 | tr -d '[:space:]')
+  [[ "$tables" =~ ^[0-9]+$ ]] || tables=0
   if (( tables < 2 )); then
     printf 'Dump enthält zu wenige CREATE/COPY-Anweisungen (%s) - vermutlich abgebrochen' "$tables"
     return 1
@@ -744,14 +766,14 @@ validate_db_dump() {
   if container_running "${DB_CONTAINER}"; then
     if docker exec -i "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" \
          --quiet --set ON_ERROR_STOP=1 -f - >/dev/null 2>&1 < "${dump}"; then
-      size_h=$(du -sh "$dump" | cut -f1)
+      size_h=$(human_size "$dump")
       printf 'Syntax vollständig lesbar (%s, %s Anweisungen)' "$size_h" "$tables"
       return 0
     fi
     # Der Dump kann einfuegen (CREATE DATABASE o.ae.) - das ist kein Fehler.
     if docker exec -i "${DB_CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" \
          --quiet -f - >/dev/null 2>&1 < "${dump}"; then
-      size_h=$(du -sh "$dump" | cut -f1)
+      size_h=$(human_size "$dump")
       printf 'lesbar (%s, %s Anweisungen, mit nicht-transaktionalen Befehlen)' "$size_h" "$tables"
       return 0
     fi
@@ -759,7 +781,7 @@ validate_db_dump() {
     return 1
   fi
 
-  size_h=$(du -sh "$dump" | cut -f1)
+  size_h=$(human_size "$dump")
   printf 'Struktur OK (%s, %s Anweisungen; Container aus, keine Syntaxprüfung)' "$size_h" "$tables"
   return 0
 }
@@ -940,8 +962,24 @@ create_archive() {
     if docker exec "${DB_CONTAINER}" pg_dump \
          --clean --if-exists -U "${DB_USER}" "${DB_NAME}" > "${db_dump}" 2>>"${LOG_FILE}"; then
       chmod 600 "${db_dump}"
-      db_size=$(du -h "${db_dump}" | cut -f1)
+      # pg_dump kann mit Exit-Code 0 zurueckkommen, obwohl kaum etwas
+      # geschrieben wurde - dann waere der Sicherungsfall ein Loch. Deshalb
+      # den Inhalt gegenpruefen, nicht nur den Rueckgabewert.
+      if ! db_detail=$(validate_db_dump "$db_dump"); then
+        log "[DB] ❌ DB-Dump unbrauchbar: ${db_detail}"
+        log "   Erwartet wird ein vollständiger pg_dump, der mit dem"
+        log "   Abschlussmarker 'database dump complete' endet."
+        rm -f "${db_dump}"
+        send_telegram "❌ Backup fehlgeschlagen
+🔴 Fehler: [DB] PostgreSQL-Dump
+⚠️ pg_dump meldete Erfolg, der Dump ist aber unbrauchbar: ${db_detail}
+💾 Erzeugt: $(wc -c < "${db_dump}" 2>/dev/null || echo 0) Byte
+📋 Log: cat ${LOG_FILE}"
+        exit "$EXIT_DB"
+      fi
+      db_size=$(human_size "${db_dump}")
       log "[DB] ✅ Dump OK (${db_size})"
+      log "[DB] ${db_detail}"
       # Global, damit der Trap auch nach dem Ende von create_archive
       # noch auf einen gültigen Pfad zeigt.
       PABO_DB_DUMP="$db_dump"
@@ -2239,7 +2277,7 @@ send_telegram "✅ Paperless Restore abgeschlossen
 # Datenmenge dauerhaft auf der Platte liegen.
 if [[ -d "${RESTORE_REPO}" && -O "${RESTORE_REPO}" ]]; then
   local restore_size
-  restore_size=$(du -sh "${RESTORE_REPO}" 2>/dev/null | cut -f1 || echo "?")
+  restore_size=$(human_size "${RESTORE_REPO}")
   read -rp "   Heruntergeladenes Restore-Repo (${restore_size}) löschen? (j/n) [j]: " del_restore
   if [[ "${del_restore:-j}" == "j" ]]; then
     rm -rf "${RESTORE_REPO}"
